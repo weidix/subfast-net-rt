@@ -1,16 +1,197 @@
 use std::collections::VecDeque;
+use std::mem::size_of;
 use std::path::Path;
 use std::time::Duration;
 
-use image::imageops::{FilterType, resize};
-use image::{DynamicImage, GenericImageView};
+use fast_image_resize::images::{Image as FirImage, ImageRef as FirImageRef};
+use fast_image_resize::{
+    FilterType as FirFilterType, PixelType, ResizeAlg, ResizeOptions, Resizer,
+};
+use image::DynamicImage;
 use serde::Serialize;
 
 use crate::error::{Result, RtError};
+use crate::ir::tensor::DType;
 use crate::tensor::Tensor;
 
 const IMAGENET_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 const IMAGENET_STD: [f32; 3] = [0.229, 0.224, 0.225];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizeMode {
+    Stretch,
+    LetterboxTopLeft,
+    LetterboxCentered,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PreprocessGeometry {
+    pub original_width: u32,
+    pub original_height: u32,
+    pub resized_width: u32,
+    pub resized_height: u32,
+    pub padded_width: u32,
+    pub padded_height: u32,
+}
+
+/// Reusable SIMD image preprocessor for decoded, tightly packed RGB8 frames.
+///
+/// File decoding is intentionally outside the hot path. Reuse both this value
+/// and a tensor returned by [`Self::new_output_tensor`] between frames to avoid
+/// all steady-state allocations.
+pub struct ImagePreprocessor {
+    shape: Vec<usize>,
+    target_width: u32,
+    target_height: u32,
+    mode: ResizeMode,
+    resizer: Resizer,
+    resized: FirImage<'static>,
+    normalize_lut: [[u32; 256]; 3],
+}
+
+impl std::fmt::Debug for ImagePreprocessor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ImagePreprocessor")
+            .field("shape", &self.shape)
+            .field("mode", &self.mode)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ImagePreprocessor {
+    pub fn new(input_shape: &[usize], mode: ResizeMode) -> Result<Self> {
+        let (target_width, target_height) = validate_input_shape(input_shape)?;
+        let mut normalize_lut = [[0u32; 256]; 3];
+        for (channel, channel_lut) in normalize_lut.iter_mut().enumerate() {
+            for (value, normalized) in channel_lut.iter_mut().enumerate() {
+                *normalized = (((value as f32 / 255.0) - IMAGENET_MEAN[channel])
+                    / IMAGENET_STD[channel])
+                    .to_bits()
+                    .to_le();
+            }
+        }
+        Ok(Self {
+            shape: input_shape.to_vec(),
+            target_width,
+            target_height,
+            mode,
+            resizer: Resizer::new(),
+            resized: FirImage::new(target_width, target_height, PixelType::U8x3),
+            normalize_lut,
+        })
+    }
+
+    pub fn new_output_tensor(&self) -> Tensor {
+        Tensor {
+            dtype: DType::Float32,
+            shape: self.shape.clone(),
+            data: vec![0; self.output_byte_len()],
+        }
+    }
+
+    pub fn preprocess_rgb(
+        &mut self,
+        rgb: &[u8],
+        width: u32,
+        height: u32,
+    ) -> Result<PreprocessedImage> {
+        let mut tensor = self.new_output_tensor();
+        let geometry = self.preprocess_rgb_into(rgb, width, height, &mut tensor)?;
+        Ok(PreprocessedImage {
+            tensor,
+            original_width: geometry.original_width,
+            original_height: geometry.original_height,
+            resized_width: geometry.resized_width,
+            resized_height: geometry.resized_height,
+            padded_width: geometry.padded_width,
+            padded_height: geometry.padded_height,
+        })
+    }
+
+    pub fn preprocess_rgb_into(
+        &mut self,
+        rgb: &[u8],
+        width: u32,
+        height: u32,
+        output: &mut Tensor,
+    ) -> Result<PreprocessGeometry> {
+        if width == 0 || height == 0 {
+            return Err(invalid_preprocess("image dimensions must be non-zero"));
+        }
+        let expected_rgb_len = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|pixels| pixels.checked_mul(3))
+            .ok_or_else(|| invalid_preprocess("RGB image byte length overflow"))?;
+        if rgb.len() != expected_rgb_len {
+            return Err(invalid_preprocess(format!(
+                "expected {expected_rgb_len} tightly packed RGB bytes for {width}x{height}, got {}",
+                rgb.len()
+            )));
+        }
+        if output.dtype != DType::Float32
+            || output.shape != self.shape
+            || output.data.len() != self.output_byte_len()
+        {
+            return Err(RtError::InvalidTensor {
+                tensor: "<runtime-input>".into(),
+                message: format!("expected float32 shape {:?}", self.shape),
+            });
+        }
+
+        let (resized_width, resized_height) = match self.mode {
+            ResizeMode::Stretch => (self.target_width, self.target_height),
+            ResizeMode::LetterboxTopLeft | ResizeMode::LetterboxCentered => {
+                letterbox_dimensions(width, height, self.target_width, self.target_height)
+            }
+        };
+        if self.resized.width() != resized_width || self.resized.height() != resized_height {
+            self.resized = FirImage::new(resized_width, resized_height, PixelType::U8x3);
+        }
+
+        let source = FirImageRef::new(width, height, rgb, PixelType::U8x3)
+            .map_err(|error| invalid_preprocess(format!("invalid RGB image: {error}")))?;
+        let options =
+            ResizeOptions::new().resize_alg(ResizeAlg::Interpolation(FirFilterType::Bilinear));
+        self.resizer
+            .resize(&source, &mut self.resized, &options)
+            .map_err(|error| invalid_preprocess(format!("SIMD resize failed: {error}")))?;
+
+        let (offset_x, offset_y) = match self.mode {
+            ResizeMode::LetterboxCentered => (
+                (self.target_width - resized_width) / 2,
+                (self.target_height - resized_height) / 2,
+            ),
+            ResizeMode::Stretch | ResizeMode::LetterboxTopLeft => (0, 0),
+        };
+        if resized_width != self.target_width || resized_height != self.target_height {
+            output.data.fill(0);
+        }
+        rgb_to_normalized_nchw(
+            self.resized.buffer(),
+            resized_width as usize,
+            resized_height as usize,
+            self.target_width as usize,
+            offset_x as usize,
+            offset_y as usize,
+            &self.normalize_lut,
+            &mut output.data,
+        );
+
+        Ok(PreprocessGeometry {
+            original_width: width,
+            original_height: height,
+            resized_width,
+            resized_height,
+            padded_width: self.target_width,
+            padded_height: self.target_height,
+        })
+    }
+
+    fn output_byte_len(&self) -> usize {
+        3 * self.target_width as usize * self.target_height as usize * size_of::<f32>()
+    }
+}
 
 #[derive(Debug)]
 pub struct PreprocessedImage {
@@ -157,29 +338,7 @@ pub fn preprocess_stretched_image_path(
             path.display()
         ))
     })?;
-    if input_shape.len() != 4 || input_shape[0] != 1 || input_shape[1] != 3 {
-        return Err(RtError::InvalidTensor {
-            tensor: "<runtime-input>".into(),
-            message: format!("expected NCHW input shape [1, 3, H, W], got {input_shape:?}"),
-        });
-    }
-    let height = input_shape[2] as u32;
-    let width = input_shape[3] as u32;
-    let resized = resize(&image.to_rgb8(), width, height, FilterType::Triangle);
-    let plane = (width * height) as usize;
-    let mut values = vec![0.0f32; 3 * plane];
-    for y in 0..height {
-        for x in 0..width {
-            let pixel = resized.get_pixel(x, y).0;
-            let index = (y * width + x) as usize;
-            for channel in 0..3 {
-                let value = f32::from(pixel[channel]) / 255.0;
-                values[channel * plane + index] =
-                    (value - IMAGENET_MEAN[channel]) / IMAGENET_STD[channel];
-            }
-        }
-    }
-    Tensor::from_f32(input_shape.to_vec(), values)
+    Ok(preprocess_dynamic_image_mode(&image, input_shape, ResizeMode::Stretch)?.tensor)
 }
 
 pub fn preprocess_centered_letterbox_image_path(
@@ -193,126 +352,116 @@ pub fn preprocess_centered_letterbox_image_path(
             path.display()
         ))
     })?;
-    if input_shape.len() != 4 || input_shape[0] != 1 || input_shape[1] != 3 {
-        return Err(RtError::InvalidTensor {
-            tensor: "<runtime-input>".into(),
-            message: format!("expected NCHW input shape [1, 3, H, W], got {input_shape:?}"),
-        });
-    }
-    let target_height = input_shape[2];
-    let target_width = input_shape[3];
-    let rgb = image.to_rgb8();
-    let (source_width, source_height) = rgb.dimensions();
-    let scale = (target_width as f32 / source_width as f32)
-        .min(target_height as f32 / source_height as f32);
-    let width = ((source_width as f32 * scale).round() as usize).max(1);
-    let height = ((source_height as f32 * scale).round() as usize).max(1);
-    let offset_x = (target_width - width) / 2;
-    let offset_y = (target_height - height) / 2;
-    let plane = target_width * target_height;
-    let mut values = vec![0.0f32; 3 * plane];
-    for y in 0..height {
-        let source_y = ((y as f32 + 0.5) * source_height as f32 / height as f32 - 0.5)
-            .clamp(0.0, source_height.saturating_sub(1) as f32);
-        let y0 = source_y.floor() as u32;
-        let y1 = (y0 + 1).min(source_height - 1);
-        let wy = source_y - y0 as f32;
-        for x in 0..width {
-            let source_x = ((x as f32 + 0.5) * source_width as f32 / width as f32 - 0.5)
-                .clamp(0.0, source_width.saturating_sub(1) as f32);
-            let x0 = source_x.floor() as u32;
-            let x1 = (x0 + 1).min(source_width - 1);
-            let wx = source_x - x0 as f32;
-            let index = (y + offset_y) * target_width + x + offset_x;
-            for channel in 0..3 {
-                let top = f32::from(rgb.get_pixel(x0, y0)[channel]) * (1.0 - wx)
-                    + f32::from(rgb.get_pixel(x1, y0)[channel]) * wx;
-                let bottom = f32::from(rgb.get_pixel(x0, y1)[channel]) * (1.0 - wx)
-                    + f32::from(rgb.get_pixel(x1, y1)[channel]) * wx;
-                let value = (top * (1.0 - wy) + bottom * wy) / 255.0;
-                values[channel * plane + index] =
-                    (value - IMAGENET_MEAN[channel]) / IMAGENET_STD[channel];
-            }
-        }
-    }
-    Tensor::from_f32(input_shape.to_vec(), values)
+    Ok(preprocess_dynamic_image_mode(&image, input_shape, ResizeMode::LetterboxCentered)?.tensor)
 }
 
 pub fn preprocess_dynamic_image(
     image: &DynamicImage,
     input_shape: &[usize],
 ) -> Result<PreprocessedImage> {
-    preprocess_dynamic_image_aligned(image, input_shape, false)
+    preprocess_dynamic_image_mode(image, input_shape, ResizeMode::LetterboxTopLeft)
 }
 
-fn preprocess_dynamic_image_aligned(
+fn preprocess_dynamic_image_mode(
     image: &DynamicImage,
     input_shape: &[usize],
-    centered: bool,
+    mode: ResizeMode,
 ) -> Result<PreprocessedImage> {
+    let mut preprocessor = ImagePreprocessor::new(input_shape, mode)?;
+    match image {
+        DynamicImage::ImageRgb8(rgb) => {
+            preprocessor.preprocess_rgb(rgb.as_raw(), rgb.width(), rgb.height())
+        }
+        _ => {
+            let rgb = image.to_rgb8();
+            preprocessor.preprocess_rgb(rgb.as_raw(), rgb.width(), rgb.height())
+        }
+    }
+}
+
+fn validate_input_shape(input_shape: &[usize]) -> Result<(u32, u32)> {
     if input_shape.len() != 4 || input_shape[0] != 1 || input_shape[1] != 3 {
         return Err(RtError::InvalidTensor {
             tensor: "<runtime-input>".into(),
             message: format!("expected NCHW input shape [1, 3, H, W], got {input_shape:?}"),
         });
     }
-
-    let padded_height = u32::try_from(input_shape[2]).map_err(|_| RtError::InvalidTensor {
+    let height = u32::try_from(input_shape[2]).map_err(|_| RtError::InvalidTensor {
         tensor: "<runtime-input>".into(),
         message: "input height does not fit u32".into(),
     })?;
-    let padded_width = u32::try_from(input_shape[3]).map_err(|_| RtError::InvalidTensor {
+    let width = u32::try_from(input_shape[3]).map_err(|_| RtError::InvalidTensor {
         tensor: "<runtime-input>".into(),
         message: "input width does not fit u32".into(),
     })?;
-    let (original_width, original_height) = image.dimensions();
-    if original_width == 0 || original_height == 0 || padded_width == 0 || padded_height == 0 {
-        return Err(RtError::InvalidTensor {
-            tensor: "<runtime-input>".into(),
-            message: "image and input dimensions must be non-zero".into(),
-        });
+    if width == 0 || height == 0 {
+        return Err(invalid_preprocess("input dimensions must be non-zero"));
     }
+    Ok((width, height))
+}
 
-    let scale = (padded_width as f32 / original_width as f32)
-        .min(padded_height as f32 / original_height as f32);
-    let resized_width = ((original_width as f32 * scale).round() as u32).max(1);
-    let resized_height = ((original_height as f32 * scale).round() as u32).max(1);
-    let rgb = image.to_rgb8();
-    let resized = resize(&rgb, resized_width, resized_height, FilterType::Triangle);
-    let offset_x = if centered {
-        (padded_width - resized_width) / 2
-    } else {
-        0
-    };
-    let offset_y = if centered {
-        (padded_height - resized_height) / 2
-    } else {
-        0
-    };
+fn letterbox_dimensions(
+    source_width: u32,
+    source_height: u32,
+    target_width: u32,
+    target_height: u32,
+) -> (u32, u32) {
+    let scale = (target_width as f32 / source_width as f32)
+        .min(target_height as f32 / source_height as f32);
+    (
+        ((source_width as f32 * scale).round() as u32)
+            .max(1)
+            .min(target_width),
+        ((source_height as f32 * scale).round() as u32)
+            .max(1)
+            .min(target_height),
+    )
+}
 
-    let plane = (padded_width * padded_height) as usize;
-    let mut values = vec![0.0f32; 3 * plane];
-    for y in 0..resized_height {
-        for x in 0..resized_width {
-            let pixel = resized.get_pixel(x, y).0;
-            let idx = ((y + offset_y) * padded_width + x + offset_x) as usize;
-            for channel in 0..3 {
-                let value = f32::from(pixel[channel]) / 255.0;
-                values[channel * plane + idx] =
-                    (value - IMAGENET_MEAN[channel]) / IMAGENET_STD[channel];
+#[allow(clippy::too_many_arguments)]
+fn rgb_to_normalized_nchw(
+    rgb: &[u8],
+    width: usize,
+    height: usize,
+    output_width: usize,
+    offset_x: usize,
+    offset_y: usize,
+    lut: &[[u32; 256]; 3],
+    output: &mut [u8],
+) {
+    let plane = output.len() / (3 * size_of::<f32>());
+    debug_assert_eq!(rgb.len(), width * height * 3);
+    debug_assert!(offset_x + width <= output_width);
+    debug_assert!((offset_y + height) * output_width <= plane);
+
+    for y in 0..height {
+        let source_row = &rgb[y * width * 3..(y + 1) * width * 3];
+        let output_row = (y + offset_y) * output_width + offset_x;
+        for (x, pixel) in source_row.chunks_exact(3).enumerate() {
+            let index = output_row + x;
+            // All offsets are proven in-bounds above. Unaligned writes are
+            // required because Tensor intentionally stores portable LE bytes.
+            unsafe {
+                let base = output.as_mut_ptr();
+                std::ptr::write_unaligned(
+                    base.add(index * 4).cast::<u32>(),
+                    lut[0][pixel[0] as usize],
+                );
+                std::ptr::write_unaligned(
+                    base.add((plane + index) * 4).cast::<u32>(),
+                    lut[1][pixel[1] as usize],
+                );
+                std::ptr::write_unaligned(
+                    base.add((2 * plane + index) * 4).cast::<u32>(),
+                    lut[2][pixel[2] as usize],
+                );
             }
         }
     }
+}
 
-    Ok(PreprocessedImage {
-        tensor: Tensor::from_f32(input_shape.to_vec(), values)?,
-        original_width,
-        original_height,
-        resized_width,
-        resized_height,
-        padded_width,
-        padded_height,
-    })
+fn invalid_preprocess(message: impl Into<String>) -> RtError {
+    RtError::Inference(format!("image preprocessing: {}", message.into()))
 }
 
 pub fn analyze_output(output: &Tensor, thresholds: DetectionThresholds) -> Result<OutputAnalysis> {

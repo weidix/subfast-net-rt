@@ -151,6 +151,27 @@ Build the CPU runtime with:
 cargo build --release
 ~~~
 
+For low-latency preprocessing, keep decoded frames as tightly packed RGB8 and
+reuse both `ImagePreprocessor` and its output tensor:
+
+~~~rust
+use subfast_net_rt::image_infer::{ImagePreprocessor, ResizeMode};
+
+let mut preprocessor =
+    ImagePreprocessor::new(&[1, 3, 32, 256], ResizeMode::LetterboxCentered)?;
+let mut input = preprocessor.new_output_tensor();
+preprocessor.preprocess_rgb_into(rgb, width, height, &mut input)?;
+~~~
+
+This path uses pure Rust SIMD resizing and performs no steady-state allocation.
+JPEG/PNG decoding is separate and is not expected to fit within a 0.1 ms
+preprocessing budget. Benchmark decoded RGB input on each target device with:
+
+~~~bash
+cargo run --release --bin preprocess-bench -- \
+  --source-width 1920 --source-height 1080 --mode centered
+~~~
+
 The JSON manifest names weights.bin. The loader validates the supplied binary
 content against all JSON offsets and lengths instead of relying on the filename.
 

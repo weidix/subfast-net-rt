@@ -1,6 +1,8 @@
 use std::time::Duration;
 use subfast_net_rt::image_infer::TimingStats;
-use subfast_net_rt::image_infer::{DetectionThresholds, analyze_output, preprocess_dynamic_image};
+use subfast_net_rt::image_infer::{
+    DetectionThresholds, ImagePreprocessor, ResizeMode, analyze_output, preprocess_dynamic_image,
+};
 use subfast_net_rt::tensor::Tensor;
 
 #[test]
@@ -28,6 +30,39 @@ fn preprocesses_rgb_image_as_nchw_imagenet_normalized_letterbox() {
     assert_eq!(values[8], 0.0, "letterbox padding must remain zero");
     assert_eq!(values[24], 0.0, "letterbox padding must remain zero");
     assert_eq!(values[40], 0.0, "letterbox padding must remain zero");
+}
+
+#[test]
+fn reusable_preprocessor_writes_into_the_same_tensor() {
+    let rgb = [255, 0, 0, 0, 255, 0];
+    let mut preprocessor = ImagePreprocessor::new(&[1, 3, 2, 4], ResizeMode::Stretch).unwrap();
+    let mut output = preprocessor.new_output_tensor();
+    let allocation = output.data.as_ptr();
+
+    let geometry = preprocessor
+        .preprocess_rgb_into(&rgb, 2, 1, &mut output)
+        .unwrap();
+    let values = output.f32_values().unwrap();
+
+    assert_eq!(allocation, output.data.as_ptr());
+    assert_eq!(geometry.resized_width, 4);
+    assert_eq!(geometry.resized_height, 2);
+    assert!((values[0] - (1.0 - 0.485) / 0.229).abs() < 1e-6);
+    assert!((values[3] - (0.0 - 0.485) / 0.229).abs() < 1e-6);
+}
+
+#[test]
+fn reusable_preprocessor_rejects_invalid_rgb_length() {
+    let mut preprocessor = ImagePreprocessor::new(&[1, 3, 32, 256], ResizeMode::Stretch).unwrap();
+    let mut output = preprocessor.new_output_tensor();
+    let error = preprocessor
+        .preprocess_rgb_into(&[0; 5], 2, 1, &mut output)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("expected 6 tightly packed RGB bytes")
+    );
 }
 
 #[test]
