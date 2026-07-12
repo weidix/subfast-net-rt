@@ -3,11 +3,13 @@
 mod support;
 
 use subfast_net_rt::backend::Backend;
-use subfast_net_rt::backend::cpu::CpuBackend;
-use subfast_net_rt::backend::gpu::GpuBackend;
+use subfast_net_rt::backend::cpu::{CpuBackend, CpuExecutable};
+use subfast_net_rt::backend::gpu::{GpuBackend, GpuExecutable};
 use subfast_net_rt::model::UnifiedModel;
 
 use support::{deterministic_input, packed_input, synthetic_pair_model, synthetic_presence_model};
+
+const MIXED_BATCH_SIZES: [usize; 5] = [32, 1, 17, 0, 32];
 
 #[test]
 fn metal_or_vulkan_matches_cpu_for_both_roi_models() {
@@ -19,13 +21,13 @@ fn metal_or_vulkan_matches_cpu_for_both_roi_models() {
     let expected = presence_cpu
         .run_scalar(std::slice::from_ref(&presence_input))
         .unwrap();
-    let mut presence_gpu = GpuBackend::with_max_batch_size(3)
+    let mut presence_gpu = GpuBackend::with_max_batch_size(32)
         .unwrap()
         .compile(&presence)
         .unwrap();
     assert_platform_backend(presence_gpu.backend_name());
     assert!(!presence_gpu.adapter_name().is_empty());
-    assert_eq!(presence_gpu.max_batch_size(), 3);
+    assert_eq!(presence_gpu.max_batch_size(), 32);
     let actual = presence_gpu
         .run_scalar(std::slice::from_ref(&presence_input))
         .unwrap();
@@ -69,9 +71,11 @@ fn metal_or_vulkan_matches_cpu_for_both_roi_models() {
     presence_gpu
         .run_batch_scalar_into(std::slice::from_ref(&empty), &mut [])
         .unwrap();
+    assert_presence_mixed_batches(&mut presence_cpu, &mut presence_gpu);
+    let oversized_presence = batch_seeds(33, 0, 0);
     assert!(
         presence_gpu
-            .run_batch_scalar(std::slice::from_ref(&packed_input(&[1, 2, 3, 4])))
+            .run_batch_scalar(std::slice::from_ref(&packed_input(&oversized_presence)))
             .is_err()
     );
     assert!(
@@ -88,13 +92,15 @@ fn metal_or_vulkan_matches_cpu_for_both_roi_models() {
     let right = deterministic_input(0x2468_ace0);
     let mut pair_cpu = CpuBackend.compile(&pair).unwrap();
     let expected = pair_cpu.run_scalar(&[left.clone(), right.clone()]).unwrap();
-    let mut pair_gpu = GpuBackend::with_max_batch_size(3)
+    let mut pair_gpu = GpuBackend::with_max_batch_size(32)
         .unwrap()
         .compile(&pair)
         .unwrap();
     assert_platform_backend(pair_gpu.backend_name());
-    let actual = pair_gpu.run_scalar(&[left, right]).unwrap();
+    let actual = pair_gpu.run_scalar(&[left.clone(), right.clone()]).unwrap();
     assert_close("pair", actual, expected);
+    let swapped = pair_gpu.run_scalar(&[right, left]).unwrap();
+    assert_close("pair swapped-input symmetry", swapped, actual);
     assert_eq!(
         actual,
         pair_gpu
@@ -131,6 +137,7 @@ fn metal_or_vulkan_matches_cpu_for_both_roi_models() {
         )
         .unwrap();
     assert_eq!(pair_actual, pair_into);
+    assert_pair_mixed_batches(&mut pair_cpu, &mut pair_gpu);
     assert!(
         pair_gpu
             .run_batch_scalar(std::slice::from_ref(&packed_input(&[1])))
@@ -141,6 +148,47 @@ fn metal_or_vulkan_matches_cpu_for_both_roi_models() {
             .run_batch_scalar(&[packed_input(&[1, 2]), packed_input(&[3])])
             .is_err()
     );
+}
+
+fn assert_presence_mixed_batches(cpu: &mut CpuExecutable, gpu: &mut GpuExecutable) {
+    for (run, batch_size) in MIXED_BATCH_SIZES.into_iter().enumerate() {
+        let seeds = batch_seeds(batch_size, 0, run);
+        let input = packed_input(&seeds);
+        let inputs = std::slice::from_ref(&input);
+        let expected = cpu.run_batch_scalar(inputs).unwrap();
+        let actual = gpu.run_batch_scalar(inputs).unwrap();
+        assert_batch_close(
+            &format!("presence mixed run {run} batch {batch_size}"),
+            &actual,
+            &expected,
+        );
+    }
+}
+
+fn assert_pair_mixed_batches(cpu: &mut CpuExecutable, gpu: &mut GpuExecutable) {
+    for (run, batch_size) in MIXED_BATCH_SIZES.into_iter().enumerate() {
+        let left_seeds = batch_seeds(batch_size, 1, run);
+        let right_seeds = batch_seeds(batch_size, 2, run);
+        let inputs = [packed_input(&left_seeds), packed_input(&right_seeds)];
+        let expected = cpu.run_batch_scalar(&inputs).unwrap();
+        let actual = gpu.run_batch_scalar(&inputs).unwrap();
+        assert_batch_close(
+            &format!("pair mixed run {run} batch {batch_size}"),
+            &actual,
+            &expected,
+        );
+    }
+}
+
+fn batch_seeds(batch_size: usize, stream: u32, run: usize) -> Vec<u32> {
+    (0..batch_size)
+        .map(|index| {
+            0x1020_3040u32
+                .wrapping_add(stream.wrapping_mul(0x1357_9bdf))
+                .wrapping_add((run as u32).wrapping_mul(0x85eb_ca6b))
+                .wrapping_add((index as u32).wrapping_mul(0x9e37_79b9))
+        })
+        .collect()
 }
 
 #[test]

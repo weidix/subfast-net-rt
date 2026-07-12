@@ -120,12 +120,30 @@ let logits = executable.run_batch_scalar(&packed_inputs)?;
 let selected_backend = executable.backend_name(); // "metal" or "vulkan"
 ~~~
 
-The backend compiles WGSL kernels for feature construction, convolution,
-depthwise convolution, masking, pooling, and linear classification. It uploads
-weights once and reuses pipelines, bind groups, activation buffers, and
-readback buffers. macOS requests only Metal; every other native target requests
-only Vulkan. Apart from input upload, command submission, and the final
-scalar readback, every model operator executes on the GPU.
+The backend uses `wgpu-hal` directly and compiles WGSL kernels through Naga for
+feature construction, convolution, depthwise convolution, masking, pooling,
+and linear classification. It uploads FP32 weights to private GPU buffers once
+and reuses pipelines, bind groups, activation buffers, and command/fence
+objects. Input and scalar-output buffers stay persistently mapped. macOS
+requests only Metal; every other native target requests only Vulkan. Apart from
+input upload, command submission, and the final scalar readback, every model
+operator executes on the GPU.
+
+Benchmark the synchronous CPU and GPU batch paths with identical inputs:
+
+~~~bash
+cargo run --release --features gpu --bin gpu-bench -- \
+  --model-path <path-to-model> \
+  --warmup 5000 \
+  --iterations 50000 \
+  --batch-sizes 32 \
+  --rounds 10
+~~~
+
+On a 10-core/10-GPU-core Apple M4, repeated direct HAL FP32 runs measured about
+2.1x Presence and Pair Matcher throughput over the CPU batch backend at batch
+32. Replacing `wgpu` with `wgpu-hal` therefore did not reach the 4x target for
+these models.
 
 Build the CPU runtime with:
 
@@ -142,7 +160,7 @@ Current limits:
 - Packed batches use `[batch, 3, 32, 256]`; GPU batches cannot exceed the maximum selected at compile time.
 - One executable owns mutable scratch storage; use one executable per concurrent request worker.
 - Inference-mode BatchNorm only.
-- FP16/FP32 float tensors for execution; int64 buffers are accepted for unused BatchNorm counters.
+- FP32 float tensors for execution; int64 buffers are accepted for unused BatchNorm counters.
 - Finite operator set.
 - No training.
 - Unknown dynamic shape is unsupported.

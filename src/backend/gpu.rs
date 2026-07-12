@@ -1,21 +1,18 @@
 //! Fixed-shape GPU backend for the ROI Presence and Pair Matcher models.
 //!
-//! WGSL compute kernels are translated by `wgpu` to Metal on macOS and to
-//! Vulkan on the other supported native targets. Input upload, command
-//! submission, and scalar readback are host operations; every model operator
-//! executes on the GPU. Weights, pipelines, bindings, and buffers are reused.
-
-use std::future::Future;
-use std::sync::Arc;
-use std::task::{Context, Poll, Wake, Waker};
+//! WGSL compute kernels are compiled through `wgpu-hal` and Naga to Metal on
+//! macOS and Vulkan on the other supported native targets. Input upload,
+//! command submission, and scalar readback are host operations; every model
+//! operator executes on the GPU. Weights, pipelines, bindings, and buffers are
+//! reused.
 
 use crate::backend::cpu::validate_roi_model;
+use crate::backend::gpu_hal as hal;
 use crate::backend::{Backend, Executable};
 use crate::error::{Result, RtError};
 use crate::ir::tensor::{DType, TensorInfo, TensorKind};
 use crate::model::UnifiedModel;
 use crate::tensor::Tensor;
-use wgpu::util::DeviceExt;
 
 const INPUT_H: usize = 32;
 const INPUT_W: usize = 256;
@@ -275,8 +272,8 @@ fn main(
     let input_base = sample * 24576u;
 
     for (var index = local; index < 864u; index += 128u) {
-        let channel = index % 3u;
-        let cell = index / 3u;
+        let channel = index / 288u;
+        let cell = index % 288u;
         let halo_x = cell % HALO_W;
         let halo_y = cell / HALO_W;
         let input_x = i32(tile_x * TILE_W + halo_x) - 2;
@@ -287,7 +284,7 @@ fn main(
                 + u32(input_y) * 256u + u32(input_x);
             delta = left[source_index] - right[source_index];
         }
-        delta_tile[index] = delta;
+        delta_tile[cell * 3u + channel] = delta;
     }
     workgroupBarrier();
 
@@ -576,10 +573,10 @@ impl GpuExecutable {
         let batch_size = output.len();
         match &mut self.model {
             CompiledGpuModel::Presence(model) => {
-                model.run(&self.context, inputs, batch_size, output)?
+                model.run(&mut self.context, inputs, batch_size, output)?
             }
             CompiledGpuModel::Pair(model) => {
-                model.run(&self.context, inputs, batch_size, output)?
+                model.run(&mut self.context, inputs, batch_size, output)?
             }
         }
         Ok(())
@@ -599,73 +596,37 @@ impl Executable for GpuExecutable {
 }
 
 struct GpuContext {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    conv_pipeline: wgpu::ComputePipeline,
-    presence_finish_pipeline: wgpu::ComputePipeline,
-    pair_feature_pipeline: wgpu::ComputePipeline,
-    pair_tail_pipeline: wgpu::ComputePipeline,
-    mappable_inputs: bool,
+    device: hal::Device,
+    runner: hal::Runner,
+    conv_pipeline: hal::Pipeline,
+    presence_finish_pipeline: hal::Pipeline,
+    pair_feature_pipeline: hal::Pipeline,
+    pair_tail_pipeline: hal::Pipeline,
     backend_name: &'static str,
     adapter_name: String,
 }
 
 impl GpuContext {
     fn new() -> Result<Self> {
-        let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle();
-        descriptor.backends = platform_backends();
-        let instance = wgpu::Instance::new(descriptor);
-        let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            force_fallback_adapter: false,
-            compatible_surface: None,
-        }))
-        .map_err(|error| {
-            RtError::Inference(format!(
-                "{} GPU adapter is unavailable: {error}",
-                platform_backend_name()
-            ))
-        })?;
-        let info = adapter.get_info();
-        if info.backend != platform_backend() {
-            return Err(RtError::Inference(format!(
-                "requested {} but wgpu selected {:?}",
-                platform_backend_name(),
-                info.backend
-            )));
-        }
-        let adapter_features = adapter.features();
-        let mut required_features = wgpu::Features::empty();
-        let mappable_inputs = adapter_features.contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS);
-        if mappable_inputs {
-            required_features |= wgpu::Features::MAPPABLE_PRIMARY_BUFFERS;
-        }
-        let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("subfast-net-rt GPU device"),
-            required_features,
-            required_limits: wgpu::Limits::default(),
-            memory_hints: wgpu::MemoryHints::Performance,
-            ..Default::default()
-        }))
-        .map_err(|error| RtError::Inference(format!("failed to create GPU device: {error}")))?;
-        let conv_pipeline = create_pipeline(&device, "subfast ROI convolution", CONV_SHADER);
+        let (device, info) = hal::Device::new()?;
+        let runner = device.create_runner()?;
+        let conv_pipeline = create_pipeline(&device, "subfast ROI convolution", CONV_SHADER)?;
         let presence_finish_pipeline = create_pipeline(
             &device,
             "subfast presence finish",
             PRESENCE_HEAD_FINISH_SHADER,
-        );
+        )?;
         let pair_feature_pipeline =
-            create_pipeline(&device, "subfast pair features", PAIR_FEATURE_TILED_SHADER);
-        let pair_tail_pipeline = create_pipeline(&device, "subfast pair tail", PAIR_TAIL_SHADER);
+            create_pipeline(&device, "subfast pair features", PAIR_FEATURE_TILED_SHADER)?;
+        let pair_tail_pipeline = create_pipeline(&device, "subfast pair tail", PAIR_TAIL_SHADER)?;
         Ok(Self {
             device,
-            queue,
+            runner,
             conv_pipeline,
             presence_finish_pipeline,
             pair_feature_pipeline,
             pair_tail_pipeline,
-            mappable_inputs,
-            backend_name: platform_backend_name(),
+            backend_name: hal::backend_name(),
             adapter_name: info.name,
         })
     }
@@ -680,157 +641,88 @@ impl GpuContext {
         Ok(())
     }
 
-    fn write_input(&self, buffer: &wgpu::Buffer, data: &[u8]) -> Result<()> {
-        if self.mappable_inputs {
-            write_mapped(&self.device, buffer, data)
-        } else {
-            self.queue.write_buffer(buffer, 0, data);
-            Ok(())
-        }
+    fn write_input(&self, buffer: &hal::Buffer, data: &[u8]) -> Result<()> {
+        buffer.write(data)
     }
 
     fn execute_presence(
-        &self,
+        &mut self,
         layers: &[GpuLayer],
         finish: &GpuKernel,
-        final_buffer: &wgpu::Buffer,
-        readback: &wgpu::Buffer,
+        output: &hal::Buffer,
         batch_size: usize,
         host_output: &mut [f32],
     ) -> Result<()> {
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("subfast ROI inference"),
-            });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("subfast ROI inference"),
-                timestamp_writes: None,
-            });
-            for layer in layers {
-                pass.set_pipeline(layer.pipeline.as_ref().unwrap_or(&self.conv_pipeline));
-                pass.set_bind_group(0, &layer.bind_group, &[]);
-                pass.dispatch_workgroups(layer.workgroups_per_sample, batch_size as u32, 1);
-            }
-            pass.set_pipeline(&self.presence_finish_pipeline);
-            pass.set_bind_group(0, &finish.bind_group, &[]);
-            pass.dispatch_workgroups(finish.workgroups_per_sample * batch_size as u32, 1, 1);
+        self.runner.begin("subfast ROI inference")?;
+        for layer in layers {
+            let pipeline = layer.pipeline.as_ref().unwrap_or(&self.conv_pipeline);
+            self.runner.dispatch(
+                pipeline,
+                &layer.bind_group,
+                [layer.workgroups_per_sample, batch_size as u32, 1],
+            );
         }
-        let byte_len = checked_bytes(batch_size, 1)?;
-        encoder.copy_buffer_to_buffer(final_buffer, 0, readback, 0, byte_len);
-        self.queue.submit(Some(encoder.finish()));
-        read_f32(&self.device, readback, &mut host_output[..batch_size])
+        self.runner.dispatch(
+            &self.presence_finish_pipeline,
+            &finish.bind_group,
+            [finish.workgroups_per_sample * batch_size as u32, 1, 1],
+        );
+        self.runner.finish()?;
+        output.read_f32(&mut host_output[..batch_size])
     }
 
     fn execute_pair(
-        &self,
+        &mut self,
         features: &GpuKernel,
         layers: &[GpuLayer],
         tail: &GpuKernel,
-        final_buffer: &wgpu::Buffer,
-        readback: &wgpu::Buffer,
+        output: &hal::Buffer,
         batch_size: usize,
         host_output: &mut [f32],
     ) -> Result<()> {
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("subfast pair inference"),
-            });
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("subfast pair inference"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.pair_feature_pipeline);
-            pass.set_bind_group(0, &features.bind_group, &[]);
-            pass.dispatch_workgroups(features.workgroups_per_sample, batch_size as u32, 1);
-
-            for layer in layers {
-                pass.set_pipeline(layer.pipeline.as_ref().unwrap_or(&self.conv_pipeline));
-                pass.set_bind_group(0, &layer.bind_group, &[]);
-                pass.dispatch_workgroups(layer.workgroups_per_sample, batch_size as u32, 1);
-            }
-
-            pass.set_pipeline(&self.pair_tail_pipeline);
-            pass.set_bind_group(0, &tail.bind_group, &[]);
-            pass.dispatch_workgroups(tail.workgroups_per_sample, batch_size as u32, 1);
+        self.runner.begin("subfast pair inference")?;
+        self.runner.dispatch(
+            &self.pair_feature_pipeline,
+            &features.bind_group,
+            [features.workgroups_per_sample, batch_size as u32, 1],
+        );
+        for layer in layers {
+            let pipeline = layer.pipeline.as_ref().unwrap_or(&self.conv_pipeline);
+            self.runner.dispatch(
+                pipeline,
+                &layer.bind_group,
+                [layer.workgroups_per_sample, batch_size as u32, 1],
+            );
         }
-        let byte_len = checked_bytes(batch_size, 1)?;
-        encoder.copy_buffer_to_buffer(final_buffer, 0, readback, 0, byte_len);
-        self.queue.submit(Some(encoder.finish()));
-        read_f32(&self.device, readback, &mut host_output[..batch_size])
+        self.runner.dispatch(
+            &self.pair_tail_pipeline,
+            &tail.bind_group,
+            [tail.workgroups_per_sample, batch_size as u32, 1],
+        );
+        self.runner.finish()?;
+        output.read_f32(&mut host_output[..batch_size])
     }
 }
 
-fn create_pipeline(device: &wgpu::Device, label: &str, source: &str) -> wgpu::ComputePipeline {
-    // Every dispatch shape and buffer extent in this backend is fixed and
-    // validated at compile time. Avoid injecting a bounds clamp for every
-    // storage access in the inner convolution loops.
-    let shader = unsafe {
-        device.create_shader_module_trusted(
-            wgpu::ShaderModuleDescriptor {
-                label: Some(label),
-                source: wgpu::ShaderSource::Wgsl(source.into()),
-            },
-            wgpu::ShaderRuntimeChecks::unchecked(),
-        )
-    };
-    device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-        label: Some(label),
-        layout: None,
-        module: &shader,
-        entry_point: Some("main"),
-        compilation_options: wgpu::PipelineCompilationOptions {
-            constants: &[],
-            zero_initialize_workgroup_memory: false,
-        },
-        cache: None,
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn platform_backends() -> wgpu::Backends {
-    wgpu::Backends::METAL
-}
-
-#[cfg(not(target_os = "macos"))]
-fn platform_backends() -> wgpu::Backends {
-    wgpu::Backends::VULKAN
-}
-
-#[cfg(target_os = "macos")]
-fn platform_backend() -> wgpu::Backend {
-    wgpu::Backend::Metal
-}
-
-#[cfg(not(target_os = "macos"))]
-fn platform_backend() -> wgpu::Backend {
-    wgpu::Backend::Vulkan
-}
-
-#[cfg(target_os = "macos")]
-fn platform_backend_name() -> &'static str {
-    "metal"
-}
-
-#[cfg(not(target_os = "macos"))]
-fn platform_backend_name() -> &'static str {
-    "vulkan"
+fn create_pipeline(
+    device: &hal::Device,
+    label: &'static str,
+    source: &str,
+) -> Result<hal::Pipeline> {
+    device.create_pipeline(label, source)
 }
 
 struct GpuLayer {
-    pipeline: Option<wgpu::ComputePipeline>,
-    bind_group: wgpu::BindGroup,
+    pipeline: Option<hal::Pipeline>,
+    bind_group: hal::BindGroup,
     workgroups_per_sample: u32,
-    _resources: Vec<wgpu::Buffer>,
+    _resources: Vec<hal::Buffer>,
 }
 
 struct GpuKernel {
-    bind_group: wgpu::BindGroup,
+    bind_group: hal::BindGroup,
     workgroups_per_sample: u32,
-    _resources: Vec<wgpu::Buffer>,
+    _resources: Vec<hal::Buffer>,
 }
 
 #[derive(Clone, Copy)]
@@ -1404,8 +1296,8 @@ fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {{
 impl GpuLayer {
     fn new(
         context: &GpuContext,
-        source: &wgpu::Buffer,
-        target: &wgpu::Buffer,
+        source: &hal::Buffer,
+        target: &hal::Buffer,
         weights: &[f32],
         bias: &[f32],
         params: ConvParams,
@@ -1420,20 +1312,16 @@ impl GpuLayer {
                 "GPU layer output {elements} is not divisible by workgroup size {WORKGROUP_SIZE}"
             )));
         }
-        let weight_buffer = context
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("subfast ROI weights"),
-                contents: f32_bytes(weights),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-        let bias_buffer = context
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("subfast ROI bias"),
-                contents: f32_bytes(bias),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
+        let weight_buffer = context.device.create_buffer_init(
+            "subfast ROI weights",
+            f32_bytes(weights),
+            hal::BufferUses::STORAGE_READ_ONLY,
+        )?;
+        let bias_buffer = context.device.create_buffer_init(
+            "subfast ROI bias",
+            f32_bytes(bias),
+            hal::BufferUses::STORAGE_READ_ONLY,
+        )?;
 
         if params.out_channels.is_multiple_of(4) {
             if !params.depthwise && !params.output_w.is_multiple_of(4) {
@@ -1454,8 +1342,21 @@ impl GpuLayer {
                 && params.output_h == 8
                 && params.output_w == 64
                 && params.out_channels == 32;
-            let spatial_dense =
-                !params.depthwise && params.kernel == [5, 5] && (presence_conv1 || presence_conv2);
+            let pair_stem = params.input_h == 32
+                && params.input_w == 256
+                && params.in_channels == 9
+                && params.output_h == 16
+                && params.output_w == 128
+                && params.out_channels == 16;
+            let pair_downsample = params.input_h == 16
+                && params.input_w == 128
+                && params.in_channels == 16
+                && params.output_h == 8
+                && params.output_w == 64
+                && params.out_channels == 32;
+            let spatial_dense = !params.depthwise
+                && ((params.kernel == [5, 5] && (presence_conv1 || presence_conv2))
+                    || (params.kernel == [3, 3] && (pair_stem || pair_downsample)));
             let outputs_per_invocation = if params.depthwise {
                 4
             } else if spatial_dense {
@@ -1478,32 +1379,13 @@ impl GpuLayer {
                 &context.device,
                 "subfast vector ROI convolution",
                 &shader_source,
-            );
-            let layout = pipeline.get_bind_group_layout(0);
-            let bind_group = context
-                .device
-                .create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("subfast vector ROI convolution bindings"),
-                    layout: &layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: source.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: weight_buffer.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: bias_buffer.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 3,
-                            resource: target.as_entire_binding(),
-                        },
-                    ],
-                });
+            )?;
+            let bind_group = sequential_bind_group(
+                &context.device,
+                &pipeline,
+                "subfast vector ROI convolution bindings",
+                &[source, &weight_buffer, &bias_buffer, target],
+            )?;
             return Ok(Self {
                 pipeline: Some(pipeline),
                 bind_group,
@@ -1535,42 +1417,17 @@ impl GpuLayer {
             },
             u32::from(params.activation),
         ];
-        let params_buffer = context
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("subfast ROI convolution parameters"),
-                contents: u32_bytes(&values),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-        let layout = context.conv_pipeline.get_bind_group_layout(0);
-        let bind_group = context
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("subfast ROI convolution bindings"),
-                layout: &layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: source.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: weight_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: bias_buffer.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: target.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: params_buffer.as_entire_binding(),
-                    },
-                ],
-            });
+        let params_buffer = context.device.create_buffer_init(
+            "subfast ROI convolution parameters",
+            u32_bytes(&values),
+            hal::BufferUses::UNIFORM,
+        )?;
+        let bind_group = sequential_bind_group(
+            &context.device,
+            &context.conv_pipeline,
+            "subfast ROI convolution bindings",
+            &[source, &weight_buffer, &bias_buffer, target, &params_buffer],
+        )?;
         Ok(Self {
             pipeline: None,
             bind_group,
@@ -1582,8 +1439,8 @@ impl GpuLayer {
     #[allow(clippy::too_many_arguments)]
     fn new_fused_separable(
         context: &GpuContext,
-        source: &wgpu::Buffer,
-        target: &wgpu::Buffer,
+        source: &hal::Buffer,
+        target: &hal::Buffer,
         depthwise_weights: &[f32],
         depthwise_bias: &[f32],
         pointwise_weights: &[f32],
@@ -1600,43 +1457,31 @@ impl GpuLayer {
                 "unsupported fused separable convolution shape".into(),
             ));
         }
-        let depthwise_weight_buffer =
-            context
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("subfast fused depthwise weights"),
-                    contents: f32_bytes(depthwise_weights),
-                    usage: wgpu::BufferUsages::STORAGE,
-                });
-        let depthwise_bias_buffer =
-            context
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("subfast fused depthwise bias"),
-                    contents: f32_bytes(depthwise_bias),
-                    usage: wgpu::BufferUsages::STORAGE,
-                });
-        let pointwise_weight_buffer =
-            context
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("subfast fused pointwise weights"),
-                    contents: f32_bytes(pointwise_weights),
-                    usage: wgpu::BufferUsages::STORAGE,
-                });
-        let pointwise_bias_buffer =
-            context
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("subfast fused pointwise bias"),
-                    contents: f32_bytes(pointwise_bias),
-                    usage: wgpu::BufferUsages::STORAGE,
-                });
+        let depthwise_weight_buffer = context.device.create_buffer_init(
+            "subfast fused depthwise weights",
+            f32_bytes(depthwise_weights),
+            hal::BufferUses::STORAGE_READ_ONLY,
+        )?;
+        let depthwise_bias_buffer = context.device.create_buffer_init(
+            "subfast fused depthwise bias",
+            f32_bytes(depthwise_bias),
+            hal::BufferUses::STORAGE_READ_ONLY,
+        )?;
+        let pointwise_weight_buffer = context.device.create_buffer_init(
+            "subfast fused pointwise weights",
+            f32_bytes(pointwise_weights),
+            hal::BufferUses::STORAGE_READ_ONLY,
+        )?;
+        let pointwise_bias_buffer = context.device.create_buffer_init(
+            "subfast fused pointwise bias",
+            f32_bytes(pointwise_bias),
+            hal::BufferUses::STORAGE_READ_ONLY,
+        )?;
         let pipeline = create_pipeline(
             &context.device,
             "subfast fused separable convolution",
             &fused_separable_spatial_shader(params),
-        );
+        )?;
         let bind_group = sequential_bind_group(
             &context.device,
             &pipeline,
@@ -1649,7 +1494,7 @@ impl GpuLayer {
                 &pointwise_bias_buffer,
                 target,
             ],
-        );
+        )?;
         Ok(Self {
             pipeline: Some(pipeline),
             bind_group,
@@ -1664,36 +1509,11 @@ impl GpuLayer {
     }
 }
 
-struct ThreadWake(std::thread::Thread);
-
-impl Wake for ThreadWake {
-    fn wake(self: Arc<Self>) {
-        self.0.unpark();
-    }
-
-    fn wake_by_ref(self: &Arc<Self>) {
-        self.0.unpark();
-    }
-}
-
-fn block_on<F: Future>(future: F) -> F::Output {
-    let waker = Waker::from(Arc::new(ThreadWake(std::thread::current())));
-    let mut context = Context::from_waker(&waker);
-    let mut future = std::pin::pin!(future);
-    loop {
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(value) => return value,
-            Poll::Pending => std::thread::park(),
-        }
-    }
-}
-
 struct PresenceGpu {
-    input: wgpu::Buffer,
-    _stage_a: wgpu::Buffer,
-    _stage_b: wgpu::Buffer,
-    output: wgpu::Buffer,
-    readback: wgpu::Buffer,
+    input: hal::Buffer,
+    _stage_a: hal::Buffer,
+    _stage_b: hal::Buffer,
+    output: hal::Buffer,
     layers: Vec<GpuLayer>,
     finish: GpuKernel,
 }
@@ -1707,34 +1527,29 @@ impl PresenceGpu {
             "subfast presence input",
             max_batch,
             INPUT_ELEMENTS,
-            if context.mappable_inputs {
-                wgpu::BufferUsages::MAP_WRITE
-            } else {
-                wgpu::BufferUsages::COPY_DST
-            },
+            hal::BufferUses::MAP_WRITE,
         )?;
         let stage_a = storage_buffer(
             &context.device,
             "subfast presence stage A",
             max_batch,
             Self::STAGE_ELEMENTS,
-            wgpu::BufferUsages::empty(),
+            hal::BufferUses::empty(),
         )?;
         let stage_b = storage_buffer(
             &context.device,
             "subfast presence stage B",
             max_batch,
             Self::STAGE_ELEMENTS,
-            wgpu::BufferUsages::empty(),
+            hal::BufferUses::empty(),
         )?;
         let output = storage_buffer(
             &context.device,
             "subfast presence output",
             max_batch,
             1,
-            wgpu::BufferUsages::COPY_SRC,
+            hal::BufferUses::MAP_READ,
         )?;
-        let readback = readback_buffer(&context.device, "subfast presence readback", max_batch, 1)?;
 
         let (conv1_weights, conv1_bias) = packed_dense(model, "backbone.0", 3, 16, [5, 5])?;
         let (conv2_weights, conv2_bias) = packed_dense(model, "backbone.2", 16, 32, [5, 5])?;
@@ -1771,26 +1586,21 @@ impl PresenceGpu {
             )?,
         ];
         let log_scale = scalar_parameter(model, "presence_head.evidence_pool.log_scale")?;
-        let head_weight_buffer =
-            context
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("subfast presence head weights"),
-                    contents: f32_bytes(&head_weights),
-                    usage: wgpu::BufferUsages::STORAGE,
-                });
-        let finish_params = context
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("subfast presence finish parameters"),
-                contents: f32_bytes(&[
-                    head_bias[0],
-                    softplus(log_scale) + 0.5,
-                    scalar_parameter(model, "presence_head.evidence_pool.bias")?,
-                    0.0,
-                ]),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
+        let head_weight_buffer = context.device.create_buffer_init(
+            "subfast presence head weights",
+            f32_bytes(&head_weights),
+            hal::BufferUses::STORAGE_READ_ONLY,
+        )?;
+        let finish_params = context.device.create_buffer_init(
+            "subfast presence finish parameters",
+            f32_bytes(&[
+                head_bias[0],
+                softplus(log_scale) + 0.5,
+                scalar_parameter(model, "presence_head.evidence_pool.bias")?,
+                0.0,
+            ]),
+            hal::BufferUses::UNIFORM,
+        )?;
         let finish_bind_group = sequential_bind_group(
             &context.device,
             &context.presence_finish_pipeline,
@@ -1802,13 +1612,12 @@ impl PresenceGpu {
                 &output,
                 &finish_params,
             ],
-        );
+        )?;
         Ok(Self {
             input,
             _stage_a: stage_a,
             _stage_b: stage_b,
             output,
-            readback,
             layers,
             finish: GpuKernel {
                 bind_group: finish_bind_group,
@@ -1820,20 +1629,13 @@ impl PresenceGpu {
 
     fn run(
         &mut self,
-        context: &GpuContext,
+        context: &mut GpuContext,
         inputs: &[Tensor],
         batch_size: usize,
         output: &mut [f32],
     ) -> Result<()> {
         context.write_input(&self.input, &inputs[0].data)?;
-        context.execute_presence(
-            &self.layers,
-            &self.finish,
-            &self.output,
-            &self.readback,
-            batch_size,
-            output,
-        )
+        context.execute_presence(&self.layers, &self.finish, &self.output, batch_size, output)
     }
 }
 
@@ -1876,13 +1678,12 @@ impl ConvParams {
 }
 
 struct PairGpu {
-    left_input: wgpu::Buffer,
-    right_input: wgpu::Buffer,
-    _features_buffer: wgpu::Buffer,
-    _stage_a: wgpu::Buffer,
-    _stage_b: wgpu::Buffer,
-    output: wgpu::Buffer,
-    readback: wgpu::Buffer,
+    left_input: hal::Buffer,
+    right_input: hal::Buffer,
+    _features_buffer: hal::Buffer,
+    _stage_a: hal::Buffer,
+    _stage_b: hal::Buffer,
+    output: hal::Buffer,
     features: GpuKernel,
     layers: Vec<GpuLayer>,
     tail: GpuKernel,
@@ -1898,52 +1699,43 @@ impl PairGpu {
             "subfast pair left input",
             max_batch,
             INPUT_ELEMENTS,
-            if context.mappable_inputs {
-                wgpu::BufferUsages::MAP_WRITE
-            } else {
-                wgpu::BufferUsages::COPY_DST
-            },
+            hal::BufferUses::MAP_WRITE,
         )?;
         let right_input = storage_buffer(
             &context.device,
             "subfast pair right input",
             max_batch,
             INPUT_ELEMENTS,
-            if context.mappable_inputs {
-                wgpu::BufferUsages::MAP_WRITE
-            } else {
-                wgpu::BufferUsages::COPY_DST
-            },
+            hal::BufferUses::MAP_WRITE,
         )?;
         let features_buffer = storage_buffer(
             &context.device,
             "subfast pair features",
             max_batch,
             Self::FEATURE_ELEMENTS,
-            wgpu::BufferUsages::empty(),
+            hal::BufferUses::empty(),
         )?;
         let stage_a = storage_buffer(
             &context.device,
             "subfast pair stage A",
             max_batch,
             Self::STAGE_ELEMENTS,
-            wgpu::BufferUsages::empty(),
+            hal::BufferUses::empty(),
         )?;
         let stage_b = storage_buffer(
             &context.device,
             "subfast pair stage B",
             max_batch,
             Self::STAGE_ELEMENTS,
-            wgpu::BufferUsages::empty(),
+            hal::BufferUses::empty(),
         )?;
         let output = storage_buffer(
             &context.device,
             "subfast pair output",
             max_batch,
             1,
-            wgpu::BufferUsages::COPY_SRC,
+            hal::BufferUses::MAP_READ,
         )?;
-        let readback = readback_buffer(&context.device, "subfast pair readback", max_batch, 1)?;
 
         let (stem_w, stem_b) = packed_dense(model, "model.stem.0", 9, 16, [3, 3])?;
         let (down_w, down_b) = packed_dense(model, "model.downsample.0", 16, 32, [3, 3])?;
@@ -1962,7 +1754,7 @@ impl PairGpu {
                 &context.pair_feature_pipeline,
                 "subfast pair feature bindings",
                 &[&left_input, &right_input, &features_buffer],
-            ),
+            )?,
             workgroups_per_sample: 64,
             _resources: Vec::new(),
         };
@@ -2052,53 +1844,36 @@ impl PairGpu {
             )?,
         ];
 
-        let mask_weight = context
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("subfast pair mask weight"),
-                contents: f32_bytes(&parameter(model, "model.text_mask.weight", &[1, 48, 1, 1])?),
-                usage: wgpu::BufferUsages::STORAGE,
-            });
-        let classifier1_weight =
-            context
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("subfast pair classifier 1 weight"),
-                    contents: f32_bytes(&parameter(
-                        model,
-                        "model.classifier.0.weight",
-                        &[32, 144],
-                    )?),
-                    usage: wgpu::BufferUsages::STORAGE,
-                });
-        let classifier1_bias =
-            context
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("subfast pair classifier 1 bias"),
-                    contents: f32_bytes(&parameter(model, "model.classifier.0.bias", &[32])?),
-                    usage: wgpu::BufferUsages::STORAGE,
-                });
-        let classifier2_weight =
-            context
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("subfast pair classifier 2 weight"),
-                    contents: f32_bytes(&parameter(model, "model.classifier.2.weight", &[1, 32])?),
-                    usage: wgpu::BufferUsages::STORAGE,
-                });
-        let tail_params = context
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("subfast pair tail parameters"),
-                contents: f32_bytes(&[
-                    scalar_parameter(model, "model.text_mask.bias")?,
-                    scalar_parameter(model, "model.classifier.2.bias")?,
-                    0.0,
-                    0.0,
-                ]),
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
+        let mask_weight = context.device.create_buffer_init(
+            "subfast pair mask weight",
+            f32_bytes(&parameter(model, "model.text_mask.weight", &[1, 48, 1, 1])?),
+            hal::BufferUses::STORAGE_READ_ONLY,
+        )?;
+        let classifier1_weight = context.device.create_buffer_init(
+            "subfast pair classifier 1 weight",
+            f32_bytes(&parameter(model, "model.classifier.0.weight", &[32, 144])?),
+            hal::BufferUses::STORAGE_READ_ONLY,
+        )?;
+        let classifier1_bias = context.device.create_buffer_init(
+            "subfast pair classifier 1 bias",
+            f32_bytes(&parameter(model, "model.classifier.0.bias", &[32])?),
+            hal::BufferUses::STORAGE_READ_ONLY,
+        )?;
+        let classifier2_weight = context.device.create_buffer_init(
+            "subfast pair classifier 2 weight",
+            f32_bytes(&parameter(model, "model.classifier.2.weight", &[1, 32])?),
+            hal::BufferUses::STORAGE_READ_ONLY,
+        )?;
+        let tail_params = context.device.create_buffer_init(
+            "subfast pair tail parameters",
+            f32_bytes(&[
+                scalar_parameter(model, "model.text_mask.bias")?,
+                scalar_parameter(model, "model.classifier.2.bias")?,
+                0.0,
+                0.0,
+            ]),
+            hal::BufferUses::UNIFORM,
+        )?;
         let tail = GpuKernel {
             bind_group: sequential_bind_group(
                 &context.device,
@@ -2113,7 +1888,7 @@ impl PairGpu {
                     &output,
                     &tail_params,
                 ],
-            ),
+            )?,
             workgroups_per_sample: 1,
             _resources: vec![
                 mask_weight,
@@ -2130,7 +1905,6 @@ impl PairGpu {
             _stage_a: stage_a,
             _stage_b: stage_b,
             output,
-            readback,
             features,
             layers,
             tail,
@@ -2139,7 +1913,7 @@ impl PairGpu {
 
     fn run(
         &mut self,
-        context: &GpuContext,
+        context: &mut GpuContext,
         inputs: &[Tensor],
         batch_size: usize,
         output: &mut [f32],
@@ -2151,7 +1925,6 @@ impl PairGpu {
             &self.layers,
             &self.tail,
             &self.output,
-            &self.readback,
             batch_size,
             output,
         )
@@ -2159,25 +1932,12 @@ impl PairGpu {
 }
 
 fn sequential_bind_group(
-    device: &wgpu::Device,
-    pipeline: &wgpu::ComputePipeline,
+    device: &hal::Device,
+    pipeline: &hal::Pipeline,
     label: &'static str,
-    buffers: &[&wgpu::Buffer],
-) -> wgpu::BindGroup {
-    let layout = pipeline.get_bind_group_layout(0);
-    let entries = buffers
-        .iter()
-        .enumerate()
-        .map(|(binding, buffer)| wgpu::BindGroupEntry {
-            binding: binding as u32,
-            resource: buffer.as_entire_binding(),
-        })
-        .collect::<Vec<_>>();
-    device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some(label),
-        layout: &layout,
-        entries: &entries,
-    })
+    buffers: &[&hal::Buffer],
+) -> Result<hal::BindGroup> {
+    device.create_bind_group(pipeline, label, buffers)
 }
 
 fn validate_runtime_inputs(inputs: &[Tensor], shapes: &[Vec<usize>]) -> Result<()> {
@@ -2374,12 +2134,12 @@ fn invalid_gpu_graph(message: impl Into<String>) -> RtError {
 }
 
 fn storage_buffer(
-    device: &wgpu::Device,
+    device: &hal::Device,
     label: &'static str,
     batch_size: usize,
     elements_per_sample: usize,
-    extra_usage: wgpu::BufferUsages,
-) -> Result<wgpu::Buffer> {
+    extra_usage: hal::BufferUses,
+) -> Result<hal::Buffer> {
     let size = checked_bytes(batch_size, elements_per_sample)?;
     let limits = device.limits();
     if size > limits.max_buffer_size || size > limits.max_storage_buffer_binding_size {
@@ -2390,33 +2150,11 @@ fn storage_buffer(
                 .min(limits.max_buffer_size)
         )));
     }
-    Ok(device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some(label),
+    device.create_buffer(
+        label,
         size,
-        usage: wgpu::BufferUsages::STORAGE | extra_usage,
-        mapped_at_creation: false,
-    }))
-}
-
-fn readback_buffer(
-    device: &wgpu::Device,
-    label: &'static str,
-    batch_size: usize,
-    elements_per_sample: usize,
-) -> Result<wgpu::Buffer> {
-    let size = checked_bytes(batch_size, elements_per_sample)?;
-    let limit = device.limits().max_buffer_size;
-    if size > limit {
-        return Err(RtError::Inference(format!(
-            "GPU readback buffer {label} requires {size} bytes, device limit is {limit}"
-        )));
-    }
-    Ok(device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some(label),
-        size,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    }))
+        hal::BufferUses::STORAGE_READ_ONLY | hal::BufferUses::STORAGE_READ_WRITE | extra_usage,
+    )
 }
 
 fn checked_bytes(batch_size: usize, elements_per_sample: usize) -> Result<u64> {
@@ -2425,94 +2163,6 @@ fn checked_bytes(batch_size: usize, elements_per_sample: usize) -> Result<u64> {
         .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
         .and_then(|value| u64::try_from(value).ok())
         .ok_or_else(|| RtError::Inference("GPU buffer size overflow".into()))
-}
-
-fn write_mapped(device: &wgpu::Device, buffer: &wgpu::Buffer, data: &[u8]) -> Result<()> {
-    let byte_len = u64::try_from(data.len())
-        .map_err(|_| RtError::Inference("GPU upload size overflow".into()))?;
-    let slice = buffer.slice(..byte_len);
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    slice.map_async(wgpu::MapMode::Write, move |result| {
-        let _ = sender.send(result);
-    });
-    let mut spins = 0usize;
-    let map_result = loop {
-        device
-            .poll(wgpu::PollType::Poll)
-            .map_err(|error| RtError::Inference(format!("GPU upload poll failed: {error}")))?;
-        match receiver.try_recv() {
-            Ok(result) => break result,
-            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                if spins < 4096 {
-                    spins += 1;
-                    std::hint::spin_loop();
-                } else {
-                    std::thread::yield_now();
-                }
-            }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                return Err(RtError::Inference("GPU upload callback was dropped".into()));
-            }
-        }
-    };
-    map_result
-        .map_err(|error| RtError::Inference(format!("GPU upload mapping failed: {error}")))?;
-    {
-        let mut mapped = slice.get_mapped_range_mut();
-        if mapped.len() != data.len() {
-            return Err(RtError::Inference(
-                "GPU upload mapping length mismatch".into(),
-            ));
-        }
-        mapped.copy_from_slice(data);
-    }
-    buffer.unmap();
-    Ok(())
-}
-
-fn read_f32(device: &wgpu::Device, buffer: &wgpu::Buffer, output: &mut [f32]) -> Result<()> {
-    let byte_len = u64::try_from(std::mem::size_of_val(output))
-        .map_err(|_| RtError::Inference("GPU readback size overflow".into()))?;
-    let slice = buffer.slice(..byte_len);
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    slice.map_async(wgpu::MapMode::Read, move |result| {
-        let _ = sender.send(result);
-    });
-    let mut spins = 0usize;
-    let map_result = loop {
-        device
-            .poll(wgpu::PollType::Poll)
-            .map_err(|error| RtError::Inference(format!("GPU poll failed: {error}")))?;
-        match receiver.try_recv() {
-            Ok(result) => break result,
-            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                if spins < 4096 {
-                    spins += 1;
-                    std::hint::spin_loop();
-                } else {
-                    std::thread::yield_now();
-                }
-            }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                return Err(RtError::Inference(
-                    "GPU readback callback was dropped".into(),
-                ));
-            }
-        }
-    };
-    map_result
-        .map_err(|error| RtError::Inference(format!("GPU readback mapping failed: {error}")))?;
-    {
-        let mapped = slice.get_mapped_range();
-        if mapped.len() != std::mem::size_of_val(output) {
-            return Err(RtError::Inference("GPU readback length mismatch".into()));
-        }
-        for (target, bytes) in output.iter_mut().zip(mapped.chunks_exact(4)) {
-            *target = f32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        }
-    }
-    buffer.unmap();
-    Ok(())
 }
 
 fn softplus(value: f32) -> f32 {
