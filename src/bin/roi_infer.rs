@@ -1,10 +1,10 @@
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use serde::Serialize;
 use subfast_net_rt::backend::Backend;
 use subfast_net_rt::backend::Executable;
-use subfast_net_rt::backend::cpu::{CpuBackend, CpuExecutable};
+use subfast_net_rt::backend::cpu::CpuBackend;
 use subfast_net_rt::image_infer::{
     preprocess_centered_letterbox_image_path, preprocess_stretched_image_path,
 };
@@ -18,17 +18,24 @@ struct Args {
     image: PathBuf,
     #[arg(long, help = "Second ROI image; required by pair-matcher models")]
     right_image: Option<PathBuf>,
+    #[arg(long, value_enum, default_value = "cpu")]
+    backend: BackendKind,
 }
 
-enum LoadedModel {
-    Unified {
-        executable: CpuExecutable,
-        input_shapes: Vec<Vec<usize>>,
-    },
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum BackendKind {
+    Cpu,
+    Gpu,
+}
+
+struct LoadedModel {
+    executable: Box<dyn Executable>,
+    input_shapes: Vec<Vec<usize>>,
 }
 
 impl LoadedModel {
-    fn load(path: &std::path::Path) -> subfast_net_rt::Result<Self> {
+    fn load(path: &std::path::Path, backend: BackendKind) -> subfast_net_rt::Result<Self> {
+        ensure_backend_available(backend)?;
         let model = subfast_net_rt::model::UnifiedModel::load(
             path.join("model.json"),
             path.join("weights.bin"),
@@ -38,36 +45,70 @@ impl LoadedModel {
             .iter()
             .map(|info| info.shape.clone())
             .collect();
-        let executable = CpuBackend.compile(&model)?;
-        Ok(Self::Unified {
+        let executable: Box<dyn Executable> = match backend {
+            BackendKind::Cpu => Box::new(CpuBackend.compile(&model)?),
+            BackendKind::Gpu => compile_gpu(&model)?,
+        };
+        Ok(Self {
             executable,
             input_shapes,
         })
     }
 
     fn input_shapes(&self) -> Vec<Vec<usize>> {
-        match self {
-            Self::Unified { input_shapes, .. } => input_shapes.clone(),
-        }
+        self.input_shapes.clone()
     }
 
     fn run(
         &mut self,
         inputs: &[subfast_net_rt::tensor::Tensor],
     ) -> subfast_net_rt::Result<subfast_net_rt::tensor::Tensor> {
-        match self {
-            Self::Unified { executable, .. } => {
-                let mut outputs = executable.run(inputs)?;
-                if outputs.len() != 1 {
-                    return Err(subfast_net_rt::RtError::Inference(format!(
-                        "ROI model must return one tensor, got {}",
-                        outputs.len()
-                    )));
-                }
-                Ok(outputs.remove(0))
-            }
+        let mut outputs = self.executable.run(inputs)?;
+        if outputs.len() != 1 {
+            return Err(subfast_net_rt::RtError::Inference(format!(
+                "ROI model must return one tensor, got {}",
+                outputs.len()
+            )));
         }
+        Ok(outputs.remove(0))
     }
+}
+
+#[cfg(feature = "gpu")]
+fn ensure_backend_available(_backend: BackendKind) -> subfast_net_rt::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(feature = "gpu"))]
+fn ensure_backend_available(backend: BackendKind) -> subfast_net_rt::Result<()> {
+    if matches!(backend, BackendKind::Gpu) {
+        return Err(gpu_feature_error());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "gpu")]
+fn compile_gpu(
+    model: &subfast_net_rt::model::UnifiedModel,
+) -> subfast_net_rt::Result<Box<dyn Executable>> {
+    use subfast_net_rt::backend::gpu::GpuBackend;
+
+    Ok(Box::new(GpuBackend::default().compile(model)?))
+}
+
+#[cfg(not(feature = "gpu"))]
+fn compile_gpu(
+    _model: &subfast_net_rt::model::UnifiedModel,
+) -> subfast_net_rt::Result<Box<dyn Executable>> {
+    Err(gpu_feature_error())
+}
+
+#[cfg(not(feature = "gpu"))]
+fn gpu_feature_error() -> subfast_net_rt::RtError {
+    subfast_net_rt::RtError::Inference(
+        "GPU backend requested, but roi-infer was built without the `gpu` feature; rebuild with `--features gpu`"
+            .into(),
+    )
 }
 
 #[derive(Serialize)]
@@ -87,7 +128,7 @@ fn main() {
 
 fn run() -> subfast_net_rt::Result<()> {
     let args = Args::parse();
-    let mut model = LoadedModel::load(&args.model_path)?;
+    let mut model = LoadedModel::load(&args.model_path, args.backend)?;
     let input_shapes = model.input_shapes();
     let image_paths = match input_shapes.len() {
         1 if args.right_image.is_none() => vec![args.image],

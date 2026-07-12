@@ -94,6 +94,7 @@ pub struct CpuBackend;
 pub struct CpuExecutable {
     input_shapes: Vec<Vec<usize>>,
     model: CompiledRoiModel,
+    batch_pool: Option<BatchPool>,
 }
 
 enum CompiledRoiModel {
@@ -101,20 +102,53 @@ enum CompiledRoiModel {
     Pair(Box<PairModel>),
 }
 
+impl CompiledRoiModel {
+    fn compile(model: &UnifiedModel, inner_parallelism: bool) -> Result<Self> {
+        match model.inputs.len() {
+            1 => Ok(Self::Presence(Box::new(PresenceModel::compile(
+                model,
+                inner_parallelism,
+            )?))),
+            2 => Ok(Self::Pair(Box::new(PairModel::compile(
+                model,
+                inner_parallelism,
+            )?))),
+            count => Err(RtError::Inference(format!(
+                "CPU ROI backend expects one or two inputs, got {count}"
+            ))),
+        }
+    }
+
+    fn run_packed_sample(
+        &mut self,
+        inputs: &[Tensor],
+        sample: usize,
+        sample_bytes: usize,
+    ) -> Result<f32> {
+        let start = sample * sample_bytes;
+        let end = start + sample_bytes;
+        match self {
+            Self::Presence(model) => model.run_bytes(&inputs[0].data[start..end]),
+            Self::Pair(model) => {
+                model.run_bytes(&inputs[0].data[start..end], &inputs[1].data[start..end])
+            }
+        }
+    }
+
+    fn worker_clone(&self) -> Self {
+        match self {
+            Self::Presence(model) => Self::Presence(Box::new(model.worker_clone())),
+            Self::Pair(model) => Self::Pair(Box::new(model.worker_clone())),
+        }
+    }
+}
+
 impl Backend for CpuBackend {
     type Executable = CpuExecutable;
 
     fn compile(&self, model: &UnifiedModel) -> Result<Self::Executable> {
         validate_model_io(model)?;
-        let compiled = match model.inputs.len() {
-            1 => CompiledRoiModel::Presence(Box::new(PresenceModel::compile(model)?)),
-            2 => CompiledRoiModel::Pair(Box::new(PairModel::compile(model)?)),
-            count => {
-                return Err(RtError::Inference(format!(
-                    "CPU ROI backend expects one or two inputs, got {count}"
-                )));
-            }
-        };
+        let compiled = CompiledRoiModel::compile(model, true)?;
         Ok(CpuExecutable {
             input_shapes: model
                 .input_info()
@@ -122,6 +156,7 @@ impl Backend for CpuBackend {
                 .map(|info| info.shape.clone())
                 .collect(),
             model: compiled,
+            batch_pool: None,
         })
     }
 }
@@ -139,9 +174,80 @@ impl CpuExecutable {
     pub fn run_scalar(&mut self, inputs: &[Tensor]) -> Result<f32> {
         validate_runtime_inputs(inputs, &self.input_shapes)?;
         match &mut self.model {
-            CompiledRoiModel::Presence(model) => model.run(&inputs[0]),
-            CompiledRoiModel::Pair(model) => model.run(&inputs[0], &inputs[1]),
+            CompiledRoiModel::Presence(model) => model.run_bytes(&inputs[0].data),
+            CompiledRoiModel::Pair(model) => model.run_bytes(&inputs[0].data, &inputs[1].data),
         }
+    }
+
+    /// Run a packed batch and return one scalar per sample without hot-path
+    /// allocation inside the inference workers.
+    ///
+    /// Each model input is a float32 tensor shaped `[batch, 3, 32, 256]`.
+    /// Samples are scheduled dynamically across persistent workers, while small
+    /// batches retain the optimized batch-1 SIMD path.
+    pub fn run_batch_scalar(&mut self, inputs: &[Tensor]) -> Result<Vec<f32>> {
+        let batch_size = validate_packed_batch_inputs(inputs, &self.input_shapes)?;
+        let mut output = vec![0.0; batch_size];
+        self.run_validated_batch(inputs, &mut output)?;
+        Ok(output)
+    }
+
+    /// Allocation-free variant of [`Self::run_batch_scalar`].
+    pub fn run_batch_scalar_into(&mut self, inputs: &[Tensor], output: &mut [f32]) -> Result<()> {
+        let batch_size = validate_packed_batch_inputs(inputs, &self.input_shapes)?;
+        if output.len() != batch_size {
+            return Err(RtError::InvalidTensor {
+                tensor: "<runtime-batch-output>".into(),
+                message: format!(
+                    "expected {batch_size} scalar output slots, got {}",
+                    output.len()
+                ),
+            });
+        }
+        self.run_validated_batch(inputs, output)
+    }
+
+    fn run_validated_batch(&mut self, inputs: &[Tensor], output: &mut [f32]) -> Result<()> {
+        let batch_size = output.len();
+        if batch_size == 0 {
+            return Ok(());
+        }
+        let sample_bytes = INPUT_SHAPE.iter().product::<usize>() * std::mem::size_of::<f32>();
+
+        // Presence already occupies four SIMD lanes per sample; a larger gate
+        // avoids losing throughput to heterogeneous-core scheduling on small batches.
+        let parallel_threshold = match &self.model {
+            #[cfg(target_arch = "aarch64")]
+            CompiledRoiModel::Presence(_) => scalar_parallelism() * 4,
+            _ => scalar_parallelism() * 2,
+        };
+        if batch_size < parallel_threshold {
+            for (sample, target) in output.iter_mut().enumerate() {
+                *target = self.model.run_packed_sample(inputs, sample, sample_bytes)?;
+            }
+        } else {
+            if self.batch_pool.is_none() {
+                self.batch_pool = Some(BatchPool::new(&self.model)?);
+            }
+            self.batch_pool.as_mut().expect("initialized above").run(
+                inputs,
+                batch_size,
+                sample_bytes,
+                output,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Run a packed batch and return the conventional `[batch]` output tensor.
+    pub fn run_batch(&mut self, inputs: &[Tensor]) -> Result<Tensor> {
+        let values = self.run_batch_scalar(inputs)?;
+        Tensor::from_f32(vec![values.len()], values)
+    }
+
+    /// Number of CPU lanes available to the batch scheduler.
+    pub fn batch_parallelism(&self) -> usize {
+        available_batch_parallelism()
     }
 
     pub fn kernel_name(&self) -> &'static str {
@@ -190,6 +296,18 @@ fn validate_model_io(model: &UnifiedModel) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "gpu")]
+pub(crate) fn validate_roi_model(model: &UnifiedModel) -> Result<()> {
+    validate_model_io(model)?;
+    match model.inputs.len() {
+        1 => require_architecture(model, 28, 3, "presence"),
+        2 => require_architecture(model, 38, 9, "pair matcher"),
+        count => Err(RtError::Inference(format!(
+            "ROI backend expects one or two inputs, got {count}"
+        ))),
+    }
+}
+
 fn validate_runtime_inputs(inputs: &[Tensor], shapes: &[Vec<usize>]) -> Result<()> {
     if inputs.len() != shapes.len() {
         return Err(RtError::InvalidTensor {
@@ -198,7 +316,11 @@ fn validate_runtime_inputs(inputs: &[Tensor], shapes: &[Vec<usize>]) -> Result<(
         });
     }
     for (index, (input, shape)) in inputs.iter().zip(shapes).enumerate() {
-        if input.dtype != DType::Float32 || input.shape != *shape {
+        let expected_bytes = DType::Float32.byte_len_for_shape(shape);
+        if input.dtype != DType::Float32
+            || input.shape != *shape
+            || expected_bytes != Some(input.data.len())
+        {
             return Err(RtError::InvalidTensor {
                 tensor: format!("input[{index}]"),
                 message: format!(
@@ -209,6 +331,353 @@ fn validate_runtime_inputs(inputs: &[Tensor], shapes: &[Vec<usize>]) -> Result<(
         }
     }
     Ok(())
+}
+
+fn validate_packed_batch_inputs(inputs: &[Tensor], shapes: &[Vec<usize>]) -> Result<usize> {
+    if inputs.len() != shapes.len() {
+        return Err(RtError::InvalidTensor {
+            tensor: "<runtime-batch-inputs>".into(),
+            message: format!("expected {} inputs, got {}", shapes.len(), inputs.len()),
+        });
+    }
+    let mut batch_size = None;
+    for (index, (input, model_shape)) in inputs.iter().zip(shapes).enumerate() {
+        let Some(first_dim) = input.shape.first().copied() else {
+            return Err(RtError::InvalidTensor {
+                tensor: format!("input[{index}]"),
+                message: "packed input must have a batch dimension".into(),
+            });
+        };
+        let shape_matches =
+            input.shape.len() == model_shape.len() && input.shape[1..] == model_shape[1..];
+        let expected_bytes = DType::Float32.byte_len_for_shape(&input.shape);
+        if input.dtype != DType::Float32
+            || !shape_matches
+            || expected_bytes != Some(input.data.len())
+        {
+            return Err(RtError::InvalidTensor {
+                tensor: format!("input[{index}]"),
+                message: format!(
+                    "expected packed float32 shape [batch, 3, 32, 256], got {} {:?}",
+                    input.dtype, input.shape
+                ),
+            });
+        }
+        if batch_size
+            .replace(first_dim)
+            .is_some_and(|size| size != first_dim)
+        {
+            return Err(RtError::InvalidTensor {
+                tensor: format!("input[{index}]"),
+                message: "all packed inputs must use the same batch size".into(),
+            });
+        }
+    }
+    Ok(batch_size.unwrap_or(0))
+}
+
+fn available_batch_parallelism() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .clamp(1, 16)
+}
+
+fn scalar_parallelism() -> usize {
+    #[cfg(target_arch = "aarch64")]
+    {
+        return available_batch_parallelism().min(4);
+    }
+    #[allow(unreachable_code)]
+    1
+}
+
+#[derive(Clone, Copy)]
+struct BatchJob {
+    inputs: usize,
+    input_count: usize,
+    batch_size: usize,
+    sample_bytes: usize,
+    output: usize,
+}
+
+struct BatchShared {
+    job: std::cell::UnsafeCell<BatchJob>,
+    generation: std::sync::atomic::AtomicU64,
+    next_sample: std::sync::atomic::AtomicUsize,
+    completed: std::sync::atomic::AtomicUsize,
+    failed: std::sync::atomic::AtomicBool,
+    error: std::sync::Mutex<Option<String>>,
+    shutdown: std::sync::atomic::AtomicBool,
+    sleep_lock: std::sync::Mutex<()>,
+    wake: std::sync::Condvar,
+}
+
+// SAFETY: one `&mut CpuExecutable` dispatcher owns the job slot. It publishes
+// each job with a release generation increment and waits for every helper before
+// the borrowed input/output pointers can expire or the slot can be overwritten.
+unsafe impl Sync for BatchShared {}
+
+struct BatchPool {
+    shared: std::sync::Arc<BatchShared>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+    caller_model: CompiledRoiModel,
+}
+
+impl BatchPool {
+    fn new(model: &CompiledRoiModel) -> Result<Self> {
+        let helper_count = available_batch_parallelism().saturating_sub(1);
+        let caller_model = model.worker_clone();
+        let workers = (0..helper_count)
+            .map(|_| model.worker_clone())
+            .collect::<Vec<_>>();
+        let shared = std::sync::Arc::new(BatchShared {
+            job: std::cell::UnsafeCell::new(BatchJob {
+                inputs: 0,
+                input_count: 0,
+                batch_size: 0,
+                sample_bytes: 0,
+                output: 0,
+            }),
+            generation: std::sync::atomic::AtomicU64::new(0),
+            next_sample: std::sync::atomic::AtomicUsize::new(0),
+            completed: std::sync::atomic::AtomicUsize::new(0),
+            failed: std::sync::atomic::AtomicBool::new(false),
+            error: std::sync::Mutex::new(None),
+            shutdown: std::sync::atomic::AtomicBool::new(false),
+            sleep_lock: std::sync::Mutex::new(()),
+            wake: std::sync::Condvar::new(),
+        });
+        let mut threads = Vec::with_capacity(helper_count);
+        for (index, worker) in workers.into_iter().enumerate() {
+            let worker_shared = std::sync::Arc::clone(&shared);
+            let handle = match std::thread::Builder::new()
+                .name(format!("subfast-batch-{}", index + 1))
+                .spawn(move || batch_worker(worker_shared, worker))
+            {
+                Ok(handle) => handle,
+                Err(error) => {
+                    stop_batch_workers(&shared, &mut threads);
+                    return Err(RtError::Inference(format!(
+                        "failed to create CPU batch worker: {error}"
+                    )));
+                }
+            };
+            threads.push(handle);
+        }
+        Ok(Self {
+            shared,
+            threads,
+            caller_model,
+        })
+    }
+
+    fn run(
+        &mut self,
+        inputs: &[Tensor],
+        batch_size: usize,
+        sample_bytes: usize,
+        output: &mut [f32],
+    ) -> Result<()> {
+        debug_assert_eq!(batch_size, output.len());
+        if self.threads.is_empty() {
+            for (sample, target) in output.iter_mut().enumerate() {
+                *target = self
+                    .caller_model
+                    .run_packed_sample(inputs, sample, sample_bytes)?;
+            }
+            return Ok(());
+        }
+
+        let job = BatchJob {
+            inputs: inputs.as_ptr() as usize,
+            input_count: inputs.len(),
+            batch_size,
+            sample_bytes,
+            output: output.as_mut_ptr() as usize,
+        };
+        let wake_guard =
+            self.shared.sleep_lock.lock().map_err(|_| {
+                RtError::Inference("CPU batch worker sleep lock is poisoned".into())
+            })?;
+        // Sample zero is reserved for the caller's single-threaded SIMD worker.
+        self.shared
+            .next_sample
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        self.shared
+            .completed
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.shared
+            .failed
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        *self
+            .shared
+            .error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        // SAFETY: dispatches are serialized by `&mut BatchPool`; all readers
+        // of the previous generation completed before its call returned.
+        unsafe {
+            *self.shared.job.get() = job;
+        }
+        self.shared
+            .generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.shared.wake.notify_all();
+        drop(wake_guard);
+
+        let caller_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let value = self
+                .caller_model
+                .run_packed_sample(inputs, 0, sample_bytes)?;
+            // SAFETY: helpers start at sample one, so slot zero belongs to caller.
+            unsafe {
+                (job.output as *mut f32).write(value);
+            }
+            // SAFETY: the input and output borrows remain live until all helpers
+            // complete below. Atomic indices give every participant disjoint output.
+            unsafe { execute_batch_job(&self.shared, job, &mut self.caller_model) }
+        }));
+        match caller_result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => record_batch_failure(&self.shared, error.to_string()),
+            Err(_) => record_batch_failure(&self.shared, "CPU batch caller panicked".into()),
+        }
+
+        while self
+            .shared
+            .completed
+            .load(std::sync::atomic::Ordering::Acquire)
+            != self.threads.len()
+        {
+            std::hint::spin_loop();
+        }
+        if self
+            .shared
+            .failed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            let message = self
+                .shared
+                .error
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                .unwrap_or_else(|| "CPU batch worker failed".into());
+            return Err(RtError::Inference(message));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for BatchPool {
+    fn drop(&mut self) {
+        stop_batch_workers(&self.shared, &mut self.threads);
+    }
+}
+
+fn stop_batch_workers(
+    shared: &std::sync::Arc<BatchShared>,
+    threads: &mut Vec<std::thread::JoinHandle<()>>,
+) {
+    let guard = shared
+        .sleep_lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    shared
+        .shutdown
+        .store(true, std::sync::atomic::Ordering::Release);
+    shared
+        .generation
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
+    shared.wake.notify_all();
+    drop(guard);
+    for thread in threads.drain(..) {
+        let _ = thread.join();
+    }
+}
+
+fn batch_worker(shared: std::sync::Arc<BatchShared>, mut model: CompiledRoiModel) {
+    let mut observed_generation = 0u64;
+    loop {
+        let generation = loop {
+            let generation = shared.generation.load(std::sync::atomic::Ordering::Acquire);
+            if generation != observed_generation {
+                break generation;
+            }
+            let guard = shared
+                .sleep_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if shared.generation.load(std::sync::atomic::Ordering::Acquire) == observed_generation
+                && !shared.shutdown.load(std::sync::atomic::Ordering::Acquire)
+            {
+                let guard = shared
+                    .wake
+                    .wait(guard)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                drop(guard);
+            }
+        };
+        if shared.shutdown.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        // SAFETY: the acquire generation load observes an immutable job that the
+        // dispatcher retains until this worker increments `completed`.
+        let job = unsafe { *shared.job.get() };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // SAFETY: the dispatcher validates and retains every pointed-to buffer;
+            // the atomic scheduler assigns each output slot once.
+            unsafe { execute_batch_job(&shared, job, &mut model) }
+        }));
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => record_batch_failure(&shared, error.to_string()),
+            Err(_) => record_batch_failure(&shared, "CPU batch worker panicked".into()),
+        }
+        shared
+            .completed
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        observed_generation = generation;
+    }
+}
+
+unsafe fn execute_batch_job(
+    shared: &BatchShared,
+    job: BatchJob,
+    model: &mut CompiledRoiModel,
+) -> Result<()> {
+    // SAFETY: `BatchPool::run` keeps this immutable slice alive for the entire job.
+    let inputs =
+        unsafe { std::slice::from_raw_parts(job.inputs as *const Tensor, job.input_count) };
+    loop {
+        if shared.failed.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(());
+        }
+        let sample = shared
+            .next_sample
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if sample >= job.batch_size {
+            return Ok(());
+        }
+        let value = model.run_packed_sample(inputs, sample, job.sample_bytes)?;
+        // SAFETY: `sample` is unique and within the initialized output allocation.
+        unsafe {
+            (job.output as *mut f32).add(sample).write(value);
+        }
+    }
+}
+
+fn record_batch_failure(shared: &BatchShared, message: String) {
+    if !shared
+        .failed
+        .swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        *shared
+            .error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(message);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -249,6 +718,7 @@ impl KernelKind {
     }
 }
 
+#[derive(Clone)]
 struct DenseConv {
     in_channels: usize,
     out_channels: usize,
@@ -257,8 +727,8 @@ struct DenseConv {
     padding: [usize; 2],
     dilation: [usize; 2],
     /// K-major weights: `[ky][kx][ic][oc]`.
-    weights: Vec<f32>,
-    bias: Vec<f32>,
+    weights: std::sync::Arc<[f32]>,
+    bias: std::sync::Arc<[f32]>,
 }
 
 impl DenseConv {
@@ -300,8 +770,8 @@ impl DenseConv {
             stride,
             padding,
             dilation,
-            weights,
-            bias,
+            weights: weights.into(),
+            bias: bias.into(),
         })
     }
 
@@ -330,12 +800,13 @@ impl DenseConv {
     }
 }
 
+#[derive(Clone)]
 struct DepthwiseConv {
     channels: usize,
     stride: [usize; 2],
     /// K-major weights: `[ky][kx][channel]`, fixed 3x3.
-    weights: Vec<f32>,
-    bias: Vec<f32>,
+    weights: std::sync::Arc<[f32]>,
+    bias: std::sync::Arc<[f32]>,
 }
 
 impl DepthwiseConv {
@@ -359,17 +830,18 @@ impl DepthwiseConv {
         Ok(Self {
             channels,
             stride,
-            weights,
-            bias,
+            weights: weights.into(),
+            bias: bias.into(),
         })
     }
 }
 
+#[derive(Clone)]
 struct Linear {
     in_features: usize,
     out_features: usize,
-    weights: Vec<f32>,
-    bias: Vec<f32>,
+    weights: std::sync::Arc<[f32]>,
+    bias: std::sync::Arc<[f32]>,
 }
 
 impl Linear {
@@ -386,8 +858,9 @@ impl Linear {
                 model,
                 &format!("{target}.weight"),
                 &[out_features, in_features],
-            )?,
-            bias: parameter(model, &format!("{target}.bias"), &[out_features])?,
+            )?
+            .into(),
+            bias: parameter(model, &format!("{target}.bias"), &[out_features])?.into(),
         })
     }
 }
@@ -422,7 +895,7 @@ struct PoolShared {
 #[cfg(target_arch = "aarch64")]
 unsafe impl Sync for PoolShared {}
 
-/// Three persistent helpers plus the caller. No thread is created on the hot path.
+/// Persistent helpers plus the caller. No thread is created on the hot path.
 #[cfg(target_arch = "aarch64")]
 struct PresencePool {
     shared: std::sync::Arc<PoolShared>,
@@ -433,10 +906,11 @@ struct PresencePool {
 #[cfg(target_arch = "aarch64")]
 impl PresencePool {
     fn new() -> Result<Self> {
-        let available = std::thread::available_parallelism()
-            .map(usize::from)
-            .unwrap_or(1);
-        let total_threads = available.clamp(1, 4);
+        Self::with_threads(scalar_parallelism(), "subfast-cpu")
+    }
+
+    fn with_threads(total_threads: usize, thread_name: &str) -> Result<Self> {
+        let total_threads = total_threads.max(1);
         let shared = std::sync::Arc::new(PoolShared {
             job: std::cell::UnsafeCell::new(DenseJob {
                 conv: 0,
@@ -461,7 +935,7 @@ impl PresencePool {
         for worker_index in 1..total_threads {
             let worker_shared = std::sync::Arc::clone(&shared);
             let handle = match std::thread::Builder::new()
-                .name(format!("subfast-cpu-{worker_index}"))
+                .name(format!("{thread_name}-{worker_index}"))
                 .spawn(move || presence_worker(worker_shared, worker_index, total_threads))
             {
                 Ok(handle) => handle,
@@ -503,11 +977,11 @@ impl PresencePool {
         input_w: usize,
         output: &mut [f32],
     ) -> Result<()> {
+        let (output_h, output_w) = conv.output_shape(input_h, input_w)?;
         if self.total_threads == 1 {
             dense_silu(KernelKind::Neon, conv, input, input_h, input_w, output);
             return Ok(());
         }
-        let (output_h, output_w) = conv.output_shape(input_h, input_w)?;
         let job = DenseJob {
             conv: conv as *const DenseConv as usize,
             input: input.as_ptr() as usize,
@@ -620,13 +1094,13 @@ fn presence_worker(shared: std::sync::Arc<PoolShared>, worker_index: usize, tota
         // SAFETY: the acquire generation load observes the published job, which
         // remains unchanged until every worker increments `completed`.
         let job = unsafe { *shared.job.get() };
-        let completed = std::panic::catch_unwind(|| {
+        let completed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // SAFETY: the dispatcher keeps all pointed-to storage alive and gives
             // this worker a disjoint output range before waiting for completion.
             unsafe {
                 execute_dense_job(job, worker_index, total_threads);
             }
-        })
+        }))
         .is_ok();
         if !completed {
             shared
@@ -671,7 +1145,7 @@ unsafe fn execute_dense_job(job: DenseJob, worker_index: usize, total_threads: u
 struct PresenceModel {
     kernel: KernelKind,
     #[cfg(target_arch = "aarch64")]
-    pool: PresencePool,
+    pool: Option<PresencePool>,
     conv1: DenseConv,
     conv2: DenseConv,
     head: DenseConv,
@@ -690,7 +1164,9 @@ struct PresenceModel {
 }
 
 impl PresenceModel {
-    fn compile(model: &UnifiedModel) -> Result<Self> {
+    fn compile(model: &UnifiedModel, inner_parallelism: bool) -> Result<Self> {
+        #[cfg(not(target_arch = "aarch64"))]
+        let _ = inner_parallelism;
         require_architecture(model, 28, 3, "presence")?;
         let conv1 = DenseConv::compile(model, "backbone.0", 3, 16, [5, 5], [2, 2], [2, 2], [1, 1])?;
         let conv2 =
@@ -718,7 +1194,7 @@ impl PresenceModel {
         Ok(Self {
             kernel: KernelKind::detect(),
             #[cfg(target_arch = "aarch64")]
-            pool: PresencePool::new()?,
+            pool: inner_parallelism.then(PresencePool::new).transpose()?,
             conv1,
             conv2,
             head,
@@ -737,18 +1213,58 @@ impl PresenceModel {
         })
     }
 
-    fn run(&mut self, input: &Tensor) -> Result<f32> {
-        nchw_bytes_to_nhwc(&input.data, 3, INPUT_H, INPUT_W, &mut self.input)?;
+    fn worker_clone(&self) -> Self {
+        Self {
+            kernel: self.kernel,
+            #[cfg(target_arch = "aarch64")]
+            pool: None,
+            conv1: self.conv1.clone(),
+            conv2: self.conv2.clone(),
+            head: self.head.clone(),
+            output_scale: self.output_scale,
+            output_bias: self.output_bias,
+            input: vec![0.0; INPUT_H * INPUT_W * 3],
+            valid_input: vec![0; INPUT_H * INPUT_W],
+            stage1: vec![0.0; 16 * 128 * 16],
+            stage2: vec![0.0; 8 * 64 * 32],
+            #[cfg(target_arch = "aarch64")]
+            head_padded: vec![0.0; 12 * 68 * 32],
+            region: vec![0.0; 8 * 64],
+            valid_region: vec![0; 8 * 64],
+            horizontal_sum: vec![0.0; 8 * 64],
+            horizontal_count: vec![0; 8 * 64],
+        }
+    }
+
+    fn run_bytes(&mut self, input: &[u8]) -> Result<f32> {
+        nchw_bytes_to_nhwc(input, 3, INPUT_H, INPUT_W, &mut self.input)?;
         for (index, pixel) in self.input.chunks_exact(3).enumerate() {
             self.valid_input[index] =
                 u8::from(pixel[0].abs().max(pixel[1].abs()).max(pixel[2].abs()) > 1e-8);
         }
         #[cfg(target_arch = "aarch64")]
         {
-            self.pool
-                .dispatch(&self.conv1, &self.input, INPUT_H, INPUT_W, &mut self.stage1)?;
-            self.pool
-                .dispatch(&self.conv2, &self.stage1, 16, 128, &mut self.stage2)?;
+            if let Some(pool) = &self.pool {
+                pool.dispatch(&self.conv1, &self.input, INPUT_H, INPUT_W, &mut self.stage1)?;
+                pool.dispatch(&self.conv2, &self.stage1, 16, 128, &mut self.stage2)?;
+            } else {
+                dense_silu(
+                    self.kernel,
+                    &self.conv1,
+                    &self.input,
+                    INPUT_H,
+                    INPUT_W,
+                    &mut self.stage1,
+                );
+                dense_silu(
+                    self.kernel,
+                    &self.conv2,
+                    &self.stage1,
+                    16,
+                    128,
+                    &mut self.stage2,
+                );
+            }
         }
         #[cfg(not(target_arch = "aarch64"))]
         {
@@ -769,107 +1285,124 @@ impl PresenceModel {
                 &mut self.stage2,
             );
         }
-        #[cfg(target_arch = "aarch64")]
-        {
-            // SAFETY: the fixed ROI shape and buffers were checked at compile
-            // time; the specialized head only touches those validated ranges.
-            unsafe {
-                simd::aarch64::presence_head(
-                    &self.head,
-                    &self.stage2,
-                    &mut self.head_padded,
-                    &mut self.region,
-                );
-            }
-        }
-        #[cfg(not(target_arch = "aarch64"))]
-        dense_linear(
+        Ok(presence_finish(
             self.kernel,
             &self.head,
             &self.stage2,
-            8,
-            64,
+            &self.valid_input,
+            self.output_scale,
+            self.output_bias,
+            #[cfg(target_arch = "aarch64")]
+            &mut self.head_padded,
             &mut self.region,
-        );
+            &mut self.valid_region,
+            &mut self.horizontal_sum,
+            &mut self.horizontal_count,
+        ))
+    }
+}
 
-        // Exported mask path: any channel -> 4x4 average -> greater than 0.5.
-        for oy in 0..8 {
-            for ox in 0..64 {
-                let mut count = 0usize;
-                for y in oy * 4..oy * 4 + 4 {
-                    let row = y * INPUT_W + ox * 4;
-                    count += self.valid_input[row..row + 4]
-                        .iter()
-                        .map(|value| usize::from(*value))
-                        .sum::<usize>();
-                }
-                self.valid_region[oy * 64 + ox] = u8::from(count > 8);
-            }
+#[allow(clippy::too_many_arguments)]
+fn presence_finish(
+    _kernel: KernelKind,
+    head: &DenseConv,
+    stage2: &[f32],
+    valid_input: &[u8],
+    output_scale: f32,
+    output_bias: f32,
+    #[cfg(target_arch = "aarch64")] head_padded: &mut [f32],
+    region: &mut [f32],
+    valid_region: &mut [u8],
+    horizontal_sum: &mut [f32],
+    horizontal_count: &mut [u8],
+) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: fixed ROI shapes and scratch lengths are established by the
+        // constructors; the specialized head only touches those ranges.
+        unsafe {
+            simd::aarch64::presence_head(head, stage2, head_padded, region);
         }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    dense_linear(_kernel, head, stage2, 8, 64, region);
 
-        // The numerator and denominator average pools have identical windows and
-        // in-bounds divisors, so their quotient is exactly a valid-only mean apart
-        // from the final floating-point rounding.
-        for y in 0..8 {
-            let row = y * 64;
-            let mut sum = 0.0f32;
-            let mut count = 0u8;
-            for x in 0..64 {
-                if x == 0 {
-                    for xx in 0..3 {
-                        if self.valid_region[row + xx] != 0 {
-                            sum += self.region[row + xx];
-                            count += 1;
-                        }
-                    }
-                } else {
-                    if x + 2 < 64 && self.valid_region[row + x + 2] != 0 {
-                        sum += self.region[row + x + 2];
+    // Exported mask path: any channel -> 4x4 average -> greater than 0.5.
+    for oy in 0..8 {
+        for ox in 0..64 {
+            let mut count = 0usize;
+            for y in oy * 4..oy * 4 + 4 {
+                let row = y * INPUT_W + ox * 4;
+                count += valid_input[row..row + 4]
+                    .iter()
+                    .map(|value| usize::from(*value))
+                    .sum::<usize>();
+            }
+            valid_region[oy * 64 + ox] = u8::from(count > 8);
+        }
+    }
+
+    // The numerator and denominator average pools have identical windows and
+    // in-bounds divisors, so their quotient is exactly a valid-only mean apart
+    // from the final floating-point rounding.
+    for y in 0..8 {
+        let row = y * 64;
+        let mut sum = 0.0f32;
+        let mut count = 0u8;
+        for x in 0..64 {
+            if x == 0 {
+                for xx in 0..3 {
+                    if valid_region[row + xx] != 0 {
+                        sum += region[row + xx];
                         count += 1;
                     }
-                    if x >= 3 && self.valid_region[row + x - 3] != 0 {
-                        sum -= self.region[row + x - 3];
-                        count -= 1;
-                    }
                 }
-                self.horizontal_sum[row + x] = sum;
-                self.horizontal_count[row + x] = count;
-            }
-        }
-        let mut evidence = f32::NEG_INFINITY;
-        for x in 0..64 {
-            let mut sum = 0.0f32;
-            let mut count = 0u16;
-            for y in 0..8 {
-                if y == 0 {
-                    for yy in 0..3 {
-                        sum += self.horizontal_sum[yy * 64 + x];
-                        count += u16::from(self.horizontal_count[yy * 64 + x]);
-                    }
-                } else {
-                    if y + 2 < 8 {
-                        sum += self.horizontal_sum[(y + 2) * 64 + x];
-                        count += u16::from(self.horizontal_count[(y + 2) * 64 + x]);
-                    }
-                    if y >= 3 {
-                        sum -= self.horizontal_sum[(y - 3) * 64 + x];
-                        count -= u16::from(self.horizontal_count[(y - 3) * 64 + x]);
-                    }
+            } else {
+                if x + 2 < 64 && valid_region[row + x + 2] != 0 {
+                    sum += region[row + x + 2];
+                    count += 1;
                 }
-                if self.valid_region[y * 64 + x] != 0 {
-                    evidence = evidence.max(sum / count.max(1) as f32);
+                if x >= 3 && valid_region[row + x - 3] != 0 {
+                    sum -= region[row + x - 3];
+                    count -= 1;
                 }
             }
+            horizontal_sum[row + x] = sum;
+            horizontal_count[row + x] = count;
         }
-        let evidence = evidence.max(-10_000.0);
-        Ok(self.output_scale * evidence + self.output_bias)
     }
+    let mut evidence = f32::NEG_INFINITY;
+    for x in 0..64 {
+        let mut sum = 0.0f32;
+        let mut count = 0u16;
+        for y in 0..8 {
+            if y == 0 {
+                for yy in 0..3 {
+                    sum += horizontal_sum[yy * 64 + x];
+                    count += u16::from(horizontal_count[yy * 64 + x]);
+                }
+            } else {
+                if y + 2 < 8 {
+                    sum += horizontal_sum[(y + 2) * 64 + x];
+                    count += u16::from(horizontal_count[(y + 2) * 64 + x]);
+                }
+                if y >= 3 {
+                    sum -= horizontal_sum[(y - 3) * 64 + x];
+                    count -= u16::from(horizontal_count[(y - 3) * 64 + x]);
+                }
+            }
+            if valid_region[y * 64 + x] != 0 {
+                evidence = evidence.max(sum / count.max(1) as f32);
+            }
+        }
+    }
+    output_scale * evidence.max(-10_000.0) + output_bias
 }
 
 struct PairModel {
     kernel: KernelKind,
     #[cfg(target_arch = "aarch64")]
-    pool: PresencePool,
+    pool: Option<PresencePool>,
     stem: DenseConv,
     downsample: DenseConv,
     detail_dw: DepthwiseConv,
@@ -878,7 +1411,7 @@ struct PairModel {
     vertical_pw: DenseConv,
     context_dw: DepthwiseConv,
     context_pw: DenseConv,
-    mask_weight: Vec<f32>,
+    mask_weight: std::sync::Arc<[f32]>,
     mask_bias: f32,
     classifier1: Linear,
     classifier2: Linear,
@@ -895,7 +1428,9 @@ struct PairModel {
 }
 
 impl PairModel {
-    fn compile(model: &UnifiedModel) -> Result<Self> {
+    fn compile(model: &UnifiedModel, inner_parallelism: bool) -> Result<Self> {
+        #[cfg(not(target_arch = "aarch64"))]
+        let _ = inner_parallelism;
         require_architecture(model, 38, 9, "pair matcher")?;
         let stem =
             DenseConv::compile(model, "model.stem.0", 9, 16, [3, 3], [2, 2], [1, 1], [1, 1])?;
@@ -959,7 +1494,7 @@ impl PairModel {
         Ok(Self {
             kernel: KernelKind::detect(),
             #[cfg(target_arch = "aarch64")]
-            pool: PresencePool::new()?,
+            pool: inner_parallelism.then(PresencePool::new).transpose()?,
             stem,
             downsample,
             detail_dw,
@@ -968,7 +1503,7 @@ impl PairModel {
             vertical_pw,
             context_dw,
             context_pw,
-            mask_weight,
+            mask_weight: mask_weight.into(),
             mask_bias,
             classifier1,
             classifier2,
@@ -985,9 +1520,39 @@ impl PairModel {
         })
     }
 
-    fn run(&mut self, left: &Tensor, right: &Tensor) -> Result<f32> {
-        nchw_bytes_to_nhwc(&left.data, 3, INPUT_H, INPUT_W, &mut self.left)?;
-        nchw_bytes_to_nhwc(&right.data, 3, INPUT_H, INPUT_W, &mut self.right)?;
+    fn worker_clone(&self) -> Self {
+        Self {
+            kernel: self.kernel,
+            #[cfg(target_arch = "aarch64")]
+            pool: None,
+            stem: self.stem.clone(),
+            downsample: self.downsample.clone(),
+            detail_dw: self.detail_dw.clone(),
+            detail_pw: self.detail_pw.clone(),
+            vertical_dw: self.vertical_dw.clone(),
+            vertical_pw: self.vertical_pw.clone(),
+            context_dw: self.context_dw.clone(),
+            context_pw: self.context_pw.clone(),
+            mask_weight: std::sync::Arc::clone(&self.mask_weight),
+            mask_bias: self.mask_bias,
+            classifier1: self.classifier1.clone(),
+            classifier2: self.classifier2.clone(),
+            left: vec![0.0; INPUT_H * INPUT_W * 3],
+            right: vec![0.0; INPUT_H * INPUT_W * 3],
+            delta: vec![0.0; INPUT_H * INPUT_W * 3],
+            integral: vec![0.0; (INPUT_H + 1) * (INPUT_W + 1) * 3],
+            features: vec![0.0; INPUT_H * INPUT_W * 9],
+            stage_a: vec![0.0; 16 * 128 * 16],
+            stage_b: vec![0.0; 16 * 128 * 16],
+            pooled: vec![0.0; 144],
+            hidden: vec![0.0; 32],
+            width_sum: vec![0.0; 64 * 48],
+        }
+    }
+
+    fn run_bytes(&mut self, left: &[u8], right: &[u8]) -> Result<f32> {
+        nchw_bytes_to_nhwc(left, 3, INPUT_H, INPUT_W, &mut self.left)?;
+        nchw_bytes_to_nhwc(right, 3, INPUT_H, INPUT_W, &mut self.right)?;
         pair_features(
             &self.left,
             &self.right,
@@ -997,20 +1562,39 @@ impl PairModel {
         );
         #[cfg(target_arch = "aarch64")]
         {
-            self.pool.dispatch(
-                &self.stem,
-                &self.features,
-                INPUT_H,
-                INPUT_W,
-                &mut self.stage_a,
-            )?;
-            self.pool.dispatch(
-                &self.downsample,
-                &self.stage_a,
-                16,
-                128,
-                &mut self.stage_b[..8 * 64 * 32],
-            )?;
+            if let Some(pool) = &self.pool {
+                pool.dispatch(
+                    &self.stem,
+                    &self.features,
+                    INPUT_H,
+                    INPUT_W,
+                    &mut self.stage_a,
+                )?;
+                pool.dispatch(
+                    &self.downsample,
+                    &self.stage_a,
+                    16,
+                    128,
+                    &mut self.stage_b[..8 * 64 * 32],
+                )?;
+            } else {
+                dense_silu(
+                    self.kernel,
+                    &self.stem,
+                    &self.features,
+                    INPUT_H,
+                    INPUT_W,
+                    &mut self.stage_a,
+                );
+                dense_silu(
+                    self.kernel,
+                    &self.downsample,
+                    &self.stage_a,
+                    16,
+                    128,
+                    &mut self.stage_b[..8 * 64 * 32],
+                );
+            }
         }
         #[cfg(not(target_arch = "aarch64"))]
         {
@@ -1131,6 +1715,11 @@ fn require_architecture(
             conv_nodes.len()
         )));
     }
+    if !fused_attributes_match(&model.graph.nodes, name) {
+        return Err(invalid_cpu_graph(format!(
+            "unsupported {name} operator attributes"
+        )));
+    }
     type ConvSpec<'a> = (&'a str, [usize; 2], [usize; 2], [usize; 2], usize);
     let presence_specs: [ConvSpec<'_>; 3] = [
         ("backbone.0", [2, 2], [2, 2], [1, 1], 1),
@@ -1189,6 +1778,115 @@ fn require_architecture(
         }
     }
     Ok(())
+}
+
+fn fused_attributes_match(nodes: &[crate::ir::graph::Node], name: &str) -> bool {
+    match name {
+        "presence" => {
+            reduce_max_matches(&nodes[6].op, &[1])
+                && greater_matches(&nodes[7].op, 1e-8)
+                && cast_f32_matches(&nodes[8].op)
+                && avg_pool_matches(&nodes[9].op, [4, 4], [4, 4], [0, 0], true)
+                && greater_matches(&nodes[10].op, 0.5)
+                && cast_f32_matches(&nodes[11].op)
+                && greater_matches(&nodes[12].op, 0.5)
+                && cast_f32_matches(&nodes[13].op)
+                && avg_pool_matches(&nodes[14].op, [5, 5], [1, 1], [2, 2], false)
+                && mul_matches(&nodes[15].op, None)
+                && avg_pool_matches(&nodes[16].op, [5, 5], [1, 1], [2, 2], false)
+                && clamp_matches(&nodes[17].op, 1e-6)
+                && greater_matches(&nodes[19].op, 0.5)
+                && masked_fill_matches(&nodes[21].op, f32::MIN)
+                && reduce_max_matches(&nodes[22].op, &[1, 2, 3])
+                && clamp_matches(&nodes[23].op, -10_000.0)
+                && add_matches(&nodes[25].op, Some(0.5))
+                && mul_matches(&nodes[26].op, None)
+                && add_matches(&nodes[27].op, None)
+        }
+        "pair matcher" => {
+            avg_pool_matches(&nodes[1].op, [5, 5], [1, 1], [2, 2], false)
+                && add_matches(&nodes[2].op, None)
+                && mul_matches(&nodes[3].op, Some(0.5))
+                && cat_matches(&nodes[7].op, 1)
+                && mul_matches(&nodes[26].op, Some(0.75))
+                && add_matches(&nodes[27].op, Some(0.25))
+                && mul_matches(&nodes[28].op, None)
+                && reduce_mean_matches(&nodes[29].op, &[2, 3])
+                && reduce_max_matches(&nodes[30].op, &[2, 3])
+                && reduce_mean_matches(&nodes[31].op, &[2])
+                && reduce_max_matches(&nodes[32].op, &[-1])
+                && cat_matches(&nodes[33].op, 1)
+                && squeeze_matches(&nodes[37].op, 1)
+        }
+        _ => false,
+    }
+}
+
+fn avg_pool_matches(
+    op: &Op,
+    expected_kernel: [usize; 2],
+    expected_stride: [usize; 2],
+    expected_padding: [usize; 2],
+    expected_count_include_pad: bool,
+) -> bool {
+    matches!(
+        op,
+        Op::AvgPool2d {
+            kernel,
+            stride,
+            padding,
+            ceil_mode: false,
+            count_include_pad,
+        } if *kernel == expected_kernel
+            && *stride == expected_stride
+            && *padding == expected_padding
+            && *count_include_pad == expected_count_include_pad
+    )
+}
+
+fn reduce_max_matches(op: &Op, expected: &[isize]) -> bool {
+    matches!(op, Op::ReduceMax { axes } if axes == expected)
+}
+
+fn reduce_mean_matches(op: &Op, expected: &[isize]) -> bool {
+    matches!(op, Op::ReduceMean { axes } if axes == expected)
+}
+
+fn greater_matches(op: &Op, expected: f32) -> bool {
+    matches!(op, Op::GreaterThan { value } if *value == expected)
+}
+
+fn clamp_matches(op: &Op, expected: f32) -> bool {
+    matches!(op, Op::ClampMin { value } if *value == expected)
+}
+
+fn masked_fill_matches(op: &Op, expected: f32) -> bool {
+    matches!(op, Op::MaskedFill { value } if *value == expected)
+}
+
+fn cast_f32_matches(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Cast {
+            dtype: DType::Float32
+        }
+    )
+}
+
+fn add_matches(op: &Op, expected: Option<f32>) -> bool {
+    matches!(op, Op::Add { alpha, value } if *alpha == 1.0 && *value == expected)
+}
+
+fn mul_matches(op: &Op, expected: Option<f32>) -> bool {
+    matches!(op, Op::Mul { value } if *value == expected)
+}
+
+fn cat_matches(op: &Op, expected: isize) -> bool {
+    matches!(op, Op::Cat { dim } if *dim == expected)
+}
+
+fn squeeze_matches(op: &Op, expected: isize) -> bool {
+    matches!(op, Op::Squeeze { dim } if *dim == expected)
 }
 
 fn parameter(model: &UnifiedModel, target: &str, shape: &[usize]) -> Result<Vec<f32>> {
@@ -1569,7 +2267,7 @@ fn linear_silu(kind: KernelKind, linear: &Linear, input: &[f32], output: &mut [f
 fn linear_scalar(linear: &Linear, input: &[f32]) -> f32 {
     debug_assert_eq!(linear.out_features, 1);
     let mut sum = linear.bias[0];
-    for (value, weight) in input.iter().zip(&linear.weights) {
+    for (value, weight) in input.iter().zip(linear.weights.iter()) {
         sum = value.mul_add(*weight, sum);
     }
     sum
