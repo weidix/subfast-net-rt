@@ -6,5 +6,5 @@ pub mod model;
 pub mod tensor;
 
 pub use error::{Result, RtError};
-pub use model::UnifiedModel;
+pub use model::Model;
 pub use tensor::Tensor;

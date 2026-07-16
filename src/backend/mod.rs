@@ -1,5 +1,5 @@
 use crate::error::Result;
-use crate::model::UnifiedModel;
+use crate::model::Model;
 use crate::tensor::Tensor;
 
 pub mod cpu;
@@ -14,7 +14,7 @@ compile_error!("the gpu feature requires a native Metal or Vulkan target");
 pub trait Backend {
     type Executable: Executable;
 
-    fn compile(&self, model: &UnifiedModel) -> Result<Self::Executable>;
+    fn compile(&self, model: &Model) -> Result<Self::Executable>;
 }
 
 pub trait Executable {

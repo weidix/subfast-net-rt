@@ -1,92 +1,15 @@
-//! Pure-Rust, fixed-shape CPU backend for the exported ROI models.
+//! Pure-Rust CPU backend for the exported ROI models.
 //!
-//! The graph is validated and fused at compile time. Runtime tensors stay in the
+//! The model contract is validated and weights are packed at compile time. Runtime tensors stay in the
 //! public NCHW byte representation, while weights and scratch buffers use typed
 //! NHWC storage. This keeps the public format portable without ever assuming
 //! that a `Vec<u8>` is aligned for `f32` or SIMD loads.
 
 use crate::backend::{Backend, Executable};
 use crate::error::{Result, RtError};
-use crate::ir::op::Op;
 use crate::ir::tensor::{DType, TensorInfo, TensorKind};
-use crate::model::UnifiedModel;
+use crate::model::{Model, ModelType};
 use crate::tensor::Tensor;
-
-const INPUT_SHAPE: [usize; 4] = [1, 3, 32, 256];
-const INPUT_H: usize = 32;
-const INPUT_W: usize = 256;
-
-const PRESENCE_OPS: [&str; 28] = [
-    "aten.conv2d.default",
-    "aten.silu_.default",
-    "aten.conv2d.default",
-    "aten.silu_.default",
-    "aten.conv2d.default",
-    "aten.abs.default",
-    "aten.amax.default",
-    "aten.gt.Scalar",
-    "aten.to.dtype",
-    "aten.avg_pool2d.default",
-    "aten.gt.Scalar",
-    "aten.to.dtype",
-    "aten.gt.Scalar",
-    "aten.to.dtype",
-    "aten.avg_pool2d.default",
-    "aten.mul.Tensor",
-    "aten.avg_pool2d.default",
-    "aten.clamp_min.default",
-    "aten.div.Tensor",
-    "aten.gt.Scalar",
-    "aten.bitwise_not.default",
-    "aten.masked_fill.Scalar",
-    "aten.amax.default",
-    "aten.clamp_min.default",
-    "aten.softplus.default",
-    "aten.add.Tensor",
-    "aten.mul.Tensor",
-    "aten.add.Tensor",
-];
-
-const PAIR_OPS: [&str; 38] = [
-    "aten.sub.Tensor",
-    "aten.avg_pool2d.default",
-    "aten.add.Tensor",
-    "aten.mul.Tensor",
-    "aten.abs.default",
-    "aten.sub.Tensor",
-    "aten.abs.default",
-    "aten.cat.default",
-    "aten.conv2d.default",
-    "aten.silu_.default",
-    "aten.conv2d.default",
-    "aten.silu_.default",
-    "aten.conv2d.default",
-    "aten.silu_.default",
-    "aten.conv2d.default",
-    "aten.silu_.default",
-    "aten.conv2d.default",
-    "aten.silu_.default",
-    "aten.conv2d.default",
-    "aten.silu_.default",
-    "aten.conv2d.default",
-    "aten.silu_.default",
-    "aten.conv2d.default",
-    "aten.silu_.default",
-    "aten.conv2d.default",
-    "aten.sigmoid.default",
-    "aten.mul.Tensor",
-    "aten.add.Tensor",
-    "aten.mul.Tensor",
-    "aten.mean.dim",
-    "aten.amax.default",
-    "aten.mean.dim",
-    "aten.amax.default",
-    "aten.cat.default",
-    "aten.linear.default",
-    "aten.silu_.default",
-    "aten.linear.default",
-    "aten.squeeze.dim",
-];
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CpuBackend;
@@ -103,7 +26,7 @@ enum CompiledRoiModel {
 }
 
 impl CompiledRoiModel {
-    fn compile(model: &UnifiedModel, inner_parallelism: bool) -> Result<Self> {
+    fn compile(model: &Model, inner_parallelism: bool) -> Result<Self> {
         match model.inputs.len() {
             1 => Ok(Self::Presence(Box::new(PresenceModel::compile(
                 model,
@@ -146,7 +69,7 @@ impl CompiledRoiModel {
 impl Backend for CpuBackend {
     type Executable = CpuExecutable;
 
-    fn compile(&self, model: &UnifiedModel) -> Result<Self::Executable> {
+    fn compile(&self, model: &Model) -> Result<Self::Executable> {
         validate_model_io(model)?;
         let compiled = CompiledRoiModel::compile(model, true)?;
         Ok(CpuExecutable {
@@ -166,7 +89,7 @@ impl CpuExecutable {
         &self.input_shapes
     }
 
-    /// Execute the scalar-output ROI graph without allocating an output tensor.
+    /// Execute the scalar-output ROI model without allocating an output tensor.
     ///
     /// All activation arenas are owned by the executable and reused between
     /// calls. The executable is intentionally `&mut self`, which also prevents
@@ -182,7 +105,7 @@ impl CpuExecutable {
     /// Run a packed batch and return one scalar per sample without hot-path
     /// allocation inside the inference workers.
     ///
-    /// Each model input is a float32 tensor shaped `[batch, 3, 32, 256]`.
+    /// Each model input is a packed float32 NCHW tensor matching the model shape.
     /// Samples are scheduled dynamically across persistent workers, while small
     /// batches retain the optimized batch-1 SIMD path.
     pub fn run_batch_scalar(&mut self, inputs: &[Tensor]) -> Result<Vec<f32>> {
@@ -212,7 +135,8 @@ impl CpuExecutable {
         if batch_size == 0 {
             return Ok(());
         }
-        let sample_bytes = INPUT_SHAPE.iter().product::<usize>() * std::mem::size_of::<f32>();
+        let sample_bytes =
+            self.input_shapes[0][1..].iter().product::<usize>() * std::mem::size_of::<f32>();
 
         // Presence already occupies four SIMD lanes per sample; a larger gate
         // avoids losing throughput to heterogeneous-core scheduling on small batches.
@@ -265,7 +189,7 @@ impl Executable for CpuExecutable {
     }
 }
 
-fn validate_model_io(model: &UnifiedModel) -> Result<()> {
+fn validate_model_io(model: &Model) -> Result<()> {
     if model.outputs.len() != 1 {
         return Err(RtError::Inference(format!(
             "CPU ROI backend expects one output, got {}",
@@ -273,11 +197,17 @@ fn validate_model_io(model: &UnifiedModel) -> Result<()> {
         )));
     }
     for info in model.input_info() {
-        if info.dtype != DType::Float32 || info.shape != INPUT_SHAPE {
+        if info.dtype != DType::Float32
+            || info.shape.len() != 4
+            || info.shape[0] != 1
+            || info.shape[1] != 3
+            || info.shape[2] == 0
+            || info.shape[3] == 0
+        {
             return Err(RtError::InvalidTensor {
                 tensor: info.name.clone(),
                 message: format!(
-                    "CPU ROI backend requires float32 shape {INPUT_SHAPE:?}, got {} {:?}",
+                    "CPU ROI backend requires float32 shape [1, 3, H, W], got {} {:?}",
                     info.dtype, info.shape
                 ),
             });
@@ -297,7 +227,7 @@ fn validate_model_io(model: &UnifiedModel) -> Result<()> {
 }
 
 #[cfg(feature = "gpu")]
-pub(crate) fn validate_roi_model(model: &UnifiedModel) -> Result<()> {
+pub(crate) fn validate_roi_model(model: &Model) -> Result<()> {
     validate_model_io(model)?;
     match model.inputs.len() {
         1 => require_architecture(model, 28, 3, "presence"),
@@ -358,7 +288,7 @@ fn validate_packed_batch_inputs(inputs: &[Tensor], shapes: &[Vec<usize>]) -> Res
             return Err(RtError::InvalidTensor {
                 tensor: format!("input[{index}]"),
                 message: format!(
-                    "expected packed float32 shape [batch, 3, 32, 256], got {} {:?}",
+                    "expected packed float32 shape [batch, 3, H, W] matching the model, got {} {:?}",
                     input.dtype, input.shape
                 ),
             });
@@ -734,7 +664,7 @@ struct DenseConv {
 impl DenseConv {
     #[allow(clippy::too_many_arguments)]
     fn compile(
-        model: &UnifiedModel,
+        model: &Model,
         target: &str,
         in_channels: usize,
         out_channels: usize,
@@ -779,19 +709,19 @@ impl DenseConv {
         let effective_h = self.dilation[0]
             .checked_mul(self.kernel[0].saturating_sub(1))
             .and_then(|value| value.checked_add(1))
-            .ok_or_else(|| invalid_cpu_graph("convolution height overflow"))?;
+            .ok_or_else(|| invalid_cpu_model("convolution height overflow"))?;
         let effective_w = self.dilation[1]
             .checked_mul(self.kernel[1].saturating_sub(1))
             .and_then(|value| value.checked_add(1))
-            .ok_or_else(|| invalid_cpu_graph("convolution width overflow"))?;
+            .ok_or_else(|| invalid_cpu_model("convolution width overflow"))?;
         let padded_h = input_h
             .checked_add(self.padding[0] * 2)
-            .ok_or_else(|| invalid_cpu_graph("padded height overflow"))?;
+            .ok_or_else(|| invalid_cpu_model("padded height overflow"))?;
         let padded_w = input_w
             .checked_add(self.padding[1] * 2)
-            .ok_or_else(|| invalid_cpu_graph("padded width overflow"))?;
+            .ok_or_else(|| invalid_cpu_model("padded width overflow"))?;
         if padded_h < effective_h || padded_w < effective_w {
-            return Err(invalid_cpu_graph("convolution kernel exceeds input"));
+            return Err(invalid_cpu_model("convolution kernel exceeds input"));
         }
         Ok((
             (padded_h - effective_h) / self.stride[0] + 1,
@@ -810,12 +740,7 @@ struct DepthwiseConv {
 }
 
 impl DepthwiseConv {
-    fn compile(
-        model: &UnifiedModel,
-        target: &str,
-        channels: usize,
-        stride: [usize; 2],
-    ) -> Result<Self> {
+    fn compile(model: &Model, target: &str, channels: usize, stride: [usize; 2]) -> Result<Self> {
         let source = parameter(model, &format!("{target}.weight"), &[channels, 1, 3, 3])?;
         let bias = parameter(model, &format!("{target}.bias"), &[channels])?;
         let mut weights = vec![0.0; source.len()];
@@ -846,7 +771,7 @@ struct Linear {
 
 impl Linear {
     fn compile(
-        model: &UnifiedModel,
+        model: &Model,
         target: &str,
         in_features: usize,
         out_features: usize,
@@ -1151,6 +1076,12 @@ struct PresenceModel {
     head: DenseConv,
     output_scale: f32,
     output_bias: f32,
+    input_h: usize,
+    input_w: usize,
+    stage1_h: usize,
+    stage1_w: usize,
+    stage2_h: usize,
+    stage2_w: usize,
     input: Vec<f32>,
     valid_input: Vec<u8>,
     stage1: Vec<f32>,
@@ -1164,7 +1095,7 @@ struct PresenceModel {
 }
 
 impl PresenceModel {
-    fn compile(model: &UnifiedModel, inner_parallelism: bool) -> Result<Self> {
+    fn compile(model: &Model, inner_parallelism: bool) -> Result<Self> {
         #[cfg(not(target_arch = "aarch64"))]
         let _ = inner_parallelism;
         require_architecture(model, 28, 3, "presence")?;
@@ -1181,12 +1112,19 @@ impl PresenceModel {
             [2, 2],
             [2, 2],
         )?;
-        if conv1.output_shape(INPUT_H, INPUT_W)? != (16, 128)
-            || conv2.output_shape(16, 128)? != (8, 64)
-            || head.output_shape(8, 64)? != (8, 64)
+        let (input_h, input_w) = model_input_hw(model)?;
+        if input_h % 4 != 0 || input_w % 4 != 0 {
+            return Err(invalid_cpu_model(
+                "presence input height and width must be divisible by 4",
+            ));
+        }
+        let (stage1_h, stage1_w) = conv1.output_shape(input_h, input_w)?;
+        let (stage2_h, stage2_w) = conv2.output_shape(stage1_h, stage1_w)?;
+        if (stage2_h, stage2_w) != (input_h / 4, input_w / 4)
+            || head.output_shape(stage2_h, stage2_w)? != (stage2_h, stage2_w)
         {
-            return Err(invalid_cpu_graph(
-                "presence convolution shapes do not match export",
+            return Err(invalid_cpu_model(
+                "presence convolution shapes do not match input",
             ));
         }
         let log_scale = scalar_parameter(model, "presence_head.evidence_pool.log_scale")?;
@@ -1200,16 +1138,22 @@ impl PresenceModel {
             head,
             output_scale: softplus(log_scale) + 0.5,
             output_bias,
-            input: vec![0.0; INPUT_H * INPUT_W * 3],
-            valid_input: vec![0; INPUT_H * INPUT_W],
-            stage1: vec![0.0; 16 * 128 * 16],
-            stage2: vec![0.0; 8 * 64 * 32],
+            input_h,
+            input_w,
+            stage1_h,
+            stage1_w,
+            stage2_h,
+            stage2_w,
+            input: vec![0.0; input_h * input_w * 3],
+            valid_input: vec![0; input_h * input_w],
+            stage1: vec![0.0; stage1_h * stage1_w * 16],
+            stage2: vec![0.0; stage2_h * stage2_w * 32],
             #[cfg(target_arch = "aarch64")]
-            head_padded: vec![0.0; 12 * 68 * 32],
-            region: vec![0.0; 8 * 64],
-            valid_region: vec![0; 8 * 64],
-            horizontal_sum: vec![0.0; 8 * 64],
-            horizontal_count: vec![0; 8 * 64],
+            head_padded: vec![0.0; (stage2_h + 4) * (stage2_w + 4) * 32],
+            region: vec![0.0; stage2_h * stage2_w],
+            valid_region: vec![0; stage2_h * stage2_w],
+            horizontal_sum: vec![0.0; stage2_h * stage2_w],
+            horizontal_count: vec![0; stage2_h * stage2_w],
         })
     }
 
@@ -1223,21 +1167,27 @@ impl PresenceModel {
             head: self.head.clone(),
             output_scale: self.output_scale,
             output_bias: self.output_bias,
-            input: vec![0.0; INPUT_H * INPUT_W * 3],
-            valid_input: vec![0; INPUT_H * INPUT_W],
-            stage1: vec![0.0; 16 * 128 * 16],
-            stage2: vec![0.0; 8 * 64 * 32],
+            input_h: self.input_h,
+            input_w: self.input_w,
+            stage1_h: self.stage1_h,
+            stage1_w: self.stage1_w,
+            stage2_h: self.stage2_h,
+            stage2_w: self.stage2_w,
+            input: vec![0.0; self.input.len()],
+            valid_input: vec![0; self.valid_input.len()],
+            stage1: vec![0.0; self.stage1.len()],
+            stage2: vec![0.0; self.stage2.len()],
             #[cfg(target_arch = "aarch64")]
-            head_padded: vec![0.0; 12 * 68 * 32],
-            region: vec![0.0; 8 * 64],
-            valid_region: vec![0; 8 * 64],
-            horizontal_sum: vec![0.0; 8 * 64],
-            horizontal_count: vec![0; 8 * 64],
+            head_padded: vec![0.0; self.head_padded.len()],
+            region: vec![0.0; self.region.len()],
+            valid_region: vec![0; self.valid_region.len()],
+            horizontal_sum: vec![0.0; self.horizontal_sum.len()],
+            horizontal_count: vec![0; self.horizontal_count.len()],
         }
     }
 
     fn run_bytes(&mut self, input: &[u8]) -> Result<f32> {
-        nchw_bytes_to_nhwc(input, 3, INPUT_H, INPUT_W, &mut self.input)?;
+        nchw_bytes_to_nhwc(input, 3, self.input_h, self.input_w, &mut self.input)?;
         for (index, pixel) in self.input.chunks_exact(3).enumerate() {
             self.valid_input[index] =
                 u8::from(pixel[0].abs().max(pixel[1].abs()).max(pixel[2].abs()) > 1e-8);
@@ -1245,23 +1195,35 @@ impl PresenceModel {
         #[cfg(target_arch = "aarch64")]
         {
             if let Some(pool) = &self.pool {
-                pool.dispatch(&self.conv1, &self.input, INPUT_H, INPUT_W, &mut self.stage1)?;
-                pool.dispatch(&self.conv2, &self.stage1, 16, 128, &mut self.stage2)?;
+                pool.dispatch(
+                    &self.conv1,
+                    &self.input,
+                    self.input_h,
+                    self.input_w,
+                    &mut self.stage1,
+                )?;
+                pool.dispatch(
+                    &self.conv2,
+                    &self.stage1,
+                    self.stage1_h,
+                    self.stage1_w,
+                    &mut self.stage2,
+                )?;
             } else {
                 dense_silu(
                     self.kernel,
                     &self.conv1,
                     &self.input,
-                    INPUT_H,
-                    INPUT_W,
+                    self.input_h,
+                    self.input_w,
                     &mut self.stage1,
                 );
                 dense_silu(
                     self.kernel,
                     &self.conv2,
                     &self.stage1,
-                    16,
-                    128,
+                    self.stage1_h,
+                    self.stage1_w,
                     &mut self.stage2,
                 );
             }
@@ -1272,16 +1234,16 @@ impl PresenceModel {
                 self.kernel,
                 &self.conv1,
                 &self.input,
-                INPUT_H,
-                INPUT_W,
+                self.input_h,
+                self.input_w,
                 &mut self.stage1,
             );
             dense_silu(
                 self.kernel,
                 &self.conv2,
                 &self.stage1,
-                16,
-                128,
+                self.stage1_h,
+                self.stage1_w,
                 &mut self.stage2,
             );
         }
@@ -1290,6 +1252,9 @@ impl PresenceModel {
             &self.head,
             &self.stage2,
             &self.valid_input,
+            self.input_w,
+            self.stage2_h,
+            self.stage2_w,
             self.output_scale,
             self.output_bias,
             #[cfg(target_arch = "aarch64")]
@@ -1308,6 +1273,9 @@ fn presence_finish(
     head: &DenseConv,
     stage2: &[f32],
     valid_input: &[u8],
+    input_w: usize,
+    region_h: usize,
+    region_w: usize,
     output_scale: f32,
     output_bias: f32,
     #[cfg(target_arch = "aarch64")] head_padded: &mut [f32],
@@ -1317,39 +1285,35 @@ fn presence_finish(
     horizontal_count: &mut [u8],
 ) -> f32 {
     #[cfg(target_arch = "aarch64")]
-    {
-        // SAFETY: fixed ROI shapes and scratch lengths are established by the
-        // constructors; the specialized head only touches those ranges.
-        unsafe {
-            simd::aarch64::presence_head(head, stage2, head_padded, region);
-        }
+    unsafe {
+        simd::aarch64::presence_head(head, stage2, region_h, region_w, head_padded, region);
     }
     #[cfg(not(target_arch = "aarch64"))]
-    dense_linear(_kernel, head, stage2, 8, 64, region);
+    dense_linear(_kernel, head, stage2, region_h, region_w, region);
 
     // Exported mask path: any channel -> 4x4 average -> greater than 0.5.
-    for oy in 0..8 {
-        for ox in 0..64 {
+    for oy in 0..region_h {
+        for ox in 0..region_w {
             let mut count = 0usize;
             for y in oy * 4..oy * 4 + 4 {
-                let row = y * INPUT_W + ox * 4;
+                let row = y * input_w + ox * 4;
                 count += valid_input[row..row + 4]
                     .iter()
                     .map(|value| usize::from(*value))
                     .sum::<usize>();
             }
-            valid_region[oy * 64 + ox] = u8::from(count > 8);
+            valid_region[oy * region_w + ox] = u8::from(count > 8);
         }
     }
 
     // The numerator and denominator average pools have identical windows and
     // in-bounds divisors, so their quotient is exactly a valid-only mean apart
     // from the final floating-point rounding.
-    for y in 0..8 {
-        let row = y * 64;
+    for y in 0..region_h {
+        let row = y * region_w;
         let mut sum = 0.0f32;
         let mut count = 0u8;
-        for x in 0..64 {
+        for x in 0..region_w {
             if x == 0 {
                 for xx in 0..3 {
                     if valid_region[row + xx] != 0 {
@@ -1358,7 +1322,7 @@ fn presence_finish(
                     }
                 }
             } else {
-                if x + 2 < 64 && valid_region[row + x + 2] != 0 {
+                if x + 2 < region_w && valid_region[row + x + 2] != 0 {
                     sum += region[row + x + 2];
                     count += 1;
                 }
@@ -1372,26 +1336,26 @@ fn presence_finish(
         }
     }
     let mut evidence = f32::NEG_INFINITY;
-    for x in 0..64 {
+    for x in 0..region_w {
         let mut sum = 0.0f32;
         let mut count = 0u16;
-        for y in 0..8 {
+        for y in 0..region_h {
             if y == 0 {
                 for yy in 0..3 {
-                    sum += horizontal_sum[yy * 64 + x];
-                    count += u16::from(horizontal_count[yy * 64 + x]);
+                    sum += horizontal_sum[yy * region_w + x];
+                    count += u16::from(horizontal_count[yy * region_w + x]);
                 }
             } else {
-                if y + 2 < 8 {
-                    sum += horizontal_sum[(y + 2) * 64 + x];
-                    count += u16::from(horizontal_count[(y + 2) * 64 + x]);
+                if y + 2 < region_h {
+                    sum += horizontal_sum[(y + 2) * region_w + x];
+                    count += u16::from(horizontal_count[(y + 2) * region_w + x]);
                 }
                 if y >= 3 {
-                    sum -= horizontal_sum[(y - 3) * 64 + x];
-                    count -= u16::from(horizontal_count[(y - 3) * 64 + x]);
+                    sum -= horizontal_sum[(y - 3) * region_w + x];
+                    count -= u16::from(horizontal_count[(y - 3) * region_w + x]);
                 }
             }
-            if valid_region[y * 64 + x] != 0 {
+            if valid_region[y * region_w + x] != 0 {
                 evidence = evidence.max(sum / count.max(1) as f32);
             }
         }
@@ -1415,6 +1379,14 @@ struct PairModel {
     mask_bias: f32,
     classifier1: Linear,
     classifier2: Linear,
+    input_h: usize,
+    input_w: usize,
+    stem_h: usize,
+    stem_w: usize,
+    down_h: usize,
+    down_w: usize,
+    final_h: usize,
+    final_w: usize,
     left: Vec<f32>,
     right: Vec<f32>,
     delta: Vec<f32>,
@@ -1428,15 +1400,14 @@ struct PairModel {
 }
 
 impl PairModel {
-    fn compile(model: &UnifiedModel, inner_parallelism: bool) -> Result<Self> {
+    fn compile(model: &Model, inner_parallelism: bool) -> Result<Self> {
         #[cfg(not(target_arch = "aarch64"))]
         let _ = inner_parallelism;
         require_architecture(model, 38, 9, "pair matcher")?;
-        let stem =
-            DenseConv::compile(model, "model.stem.0", 9, 16, [3, 3], [2, 2], [1, 1], [1, 1])?;
+        let stem = DenseConv::compile(model, "stem.0", 3, 16, [3, 3], [2, 2], [1, 1], [1, 1])?;
         let downsample = DenseConv::compile(
             model,
-            "model.downsample.0",
+            "downsample.0",
             16,
             32,
             [3, 3],
@@ -1444,21 +1415,13 @@ impl PairModel {
             [1, 1],
             [1, 1],
         )?;
-        let detail_dw = DepthwiseConv::compile(model, "model.detail.0", 32, [1, 1])?;
-        let detail_pw = DenseConv::compile(
-            model,
-            "model.detail.3",
-            32,
-            32,
-            [1, 1],
-            [1, 1],
-            [0, 0],
-            [1, 1],
-        )?;
-        let vertical_dw = DepthwiseConv::compile(model, "model.vertical_downsample.0", 32, [2, 1])?;
+        let detail_dw = DepthwiseConv::compile(model, "detail.0", 32, [1, 1])?;
+        let detail_pw =
+            DenseConv::compile(model, "detail.3", 32, 32, [1, 1], [1, 1], [0, 0], [1, 1])?;
+        let vertical_dw = DepthwiseConv::compile(model, "vertical_downsample.0", 32, [2, 1])?;
         let vertical_pw = DenseConv::compile(
             model,
-            "model.vertical_downsample.3",
+            "vertical_downsample.3",
             32,
             48,
             [1, 1],
@@ -1466,31 +1429,30 @@ impl PairModel {
             [0, 0],
             [1, 1],
         )?;
-        let context_dw = DepthwiseConv::compile(model, "model.context.0", 48, [1, 1])?;
-        let context_pw = DenseConv::compile(
-            model,
-            "model.context.3",
-            48,
-            48,
-            [1, 1],
-            [1, 1],
-            [0, 0],
-            [1, 1],
-        )?;
-        let mask_weight = parameter(model, "model.text_mask.weight", &[1, 48, 1, 1])?;
-        let mask_bias = scalar_parameter(model, "model.text_mask.bias")?;
-        let classifier1 = Linear::compile(model, "model.classifier.0", 144, 32)?;
-        let classifier2 = Linear::compile(model, "model.classifier.2", 32, 1)?;
-        if stem.output_shape(INPUT_H, INPUT_W)? != (16, 128)
-            || downsample.output_shape(16, 128)? != (8, 64)
-            || detail_pw.output_shape(8, 64)? != (8, 64)
-            || vertical_pw.output_shape(4, 64)? != (4, 64)
-            || context_pw.output_shape(4, 64)? != (4, 64)
+        let context_dw = DepthwiseConv::compile(model, "context.0", 48, [1, 1])?;
+        let context_pw =
+            DenseConv::compile(model, "context.3", 48, 48, [1, 1], [1, 1], [0, 0], [1, 1])?;
+        let mask_weight = parameter(model, "text_mask.weight", &[1, 48, 1, 1])?;
+        let mask_bias = scalar_parameter(model, "text_mask.bias")?;
+        let classifier1 = Linear::compile(model, "classifier.0", 144, 32)?;
+        let classifier2 = Linear::compile(model, "classifier.2", 32, 1)?;
+        let (input_h, input_w) = model_input_hw(model)?;
+        let (stem_h, stem_w) = stem.output_shape(input_h, input_w)?;
+        let (down_h, down_w) = downsample.output_shape(stem_h, stem_w)?;
+        let (detail_h, detail_w) = detail_pw.output_shape(down_h, down_w)?;
+        let final_h = (detail_h + 1) / 2;
+        let final_w = detail_w;
+        if vertical_pw.output_shape(final_h, final_w)? != (final_h, final_w)
+            || context_pw.output_shape(final_h, final_w)? != (final_h, final_w)
         {
-            return Err(invalid_cpu_graph(
-                "pair convolution shapes do not match export",
+            return Err(invalid_cpu_model(
+                "pair convolution shapes do not match input",
             ));
         }
+        let input_elements = input_h * input_w;
+        let arena_elements = (stem_h * stem_w * 16)
+            .max(down_h * down_w * 32)
+            .max(final_h * final_w * 48);
         Ok(Self {
             kernel: KernelKind::detect(),
             #[cfg(target_arch = "aarch64")]
@@ -1507,16 +1469,24 @@ impl PairModel {
             mask_bias,
             classifier1,
             classifier2,
-            left: vec![0.0; INPUT_H * INPUT_W * 3],
-            right: vec![0.0; INPUT_H * INPUT_W * 3],
-            delta: vec![0.0; INPUT_H * INPUT_W * 3],
-            integral: vec![0.0; (INPUT_H + 1) * (INPUT_W + 1) * 3],
-            features: vec![0.0; INPUT_H * INPUT_W * 9],
-            stage_a: vec![0.0; 16 * 128 * 16],
-            stage_b: vec![0.0; 16 * 128 * 16],
+            input_h,
+            input_w,
+            stem_h,
+            stem_w,
+            down_h,
+            down_w,
+            final_h,
+            final_w,
+            left: vec![0.0; input_elements * 3],
+            right: vec![0.0; input_elements * 3],
+            delta: vec![0.0; input_elements],
+            integral: vec![0.0; (input_h + 1) * (input_w + 1)],
+            features: vec![0.0; input_elements * 3],
+            stage_a: vec![0.0; arena_elements],
+            stage_b: vec![0.0; arena_elements],
             pooled: vec![0.0; 144],
             hidden: vec![0.0; 32],
-            width_sum: vec![0.0; 64 * 48],
+            width_sum: vec![0.0; final_w * 48],
         })
     }
 
@@ -1537,28 +1507,38 @@ impl PairModel {
             mask_bias: self.mask_bias,
             classifier1: self.classifier1.clone(),
             classifier2: self.classifier2.clone(),
-            left: vec![0.0; INPUT_H * INPUT_W * 3],
-            right: vec![0.0; INPUT_H * INPUT_W * 3],
-            delta: vec![0.0; INPUT_H * INPUT_W * 3],
-            integral: vec![0.0; (INPUT_H + 1) * (INPUT_W + 1) * 3],
-            features: vec![0.0; INPUT_H * INPUT_W * 9],
-            stage_a: vec![0.0; 16 * 128 * 16],
-            stage_b: vec![0.0; 16 * 128 * 16],
+            input_h: self.input_h,
+            input_w: self.input_w,
+            stem_h: self.stem_h,
+            stem_w: self.stem_w,
+            down_h: self.down_h,
+            down_w: self.down_w,
+            final_h: self.final_h,
+            final_w: self.final_w,
+            left: vec![0.0; self.left.len()],
+            right: vec![0.0; self.right.len()],
+            delta: vec![0.0; self.delta.len()],
+            integral: vec![0.0; self.integral.len()],
+            features: vec![0.0; self.features.len()],
+            stage_a: vec![0.0; self.stage_a.len()],
+            stage_b: vec![0.0; self.stage_b.len()],
             pooled: vec![0.0; 144],
             hidden: vec![0.0; 32],
-            width_sum: vec![0.0; 64 * 48],
+            width_sum: vec![0.0; self.width_sum.len()],
         }
     }
 
     fn run_bytes(&mut self, left: &[u8], right: &[u8]) -> Result<f32> {
-        nchw_bytes_to_nhwc(left, 3, INPUT_H, INPUT_W, &mut self.left)?;
-        nchw_bytes_to_nhwc(right, 3, INPUT_H, INPUT_W, &mut self.right)?;
+        nchw_bytes_to_nhwc(left, 3, self.input_h, self.input_w, &mut self.left)?;
+        nchw_bytes_to_nhwc(right, 3, self.input_h, self.input_w, &mut self.right)?;
         pair_features(
             &self.left,
             &self.right,
             &mut self.delta,
             &mut self.integral,
             &mut self.features,
+            self.input_h,
+            self.input_w,
         );
         #[cfg(target_arch = "aarch64")]
         {
@@ -1566,33 +1546,33 @@ impl PairModel {
                 pool.dispatch(
                     &self.stem,
                     &self.features,
-                    INPUT_H,
-                    INPUT_W,
+                    self.input_h,
+                    self.input_w,
                     &mut self.stage_a,
                 )?;
                 pool.dispatch(
                     &self.downsample,
                     &self.stage_a,
-                    16,
-                    128,
-                    &mut self.stage_b[..8 * 64 * 32],
+                    self.stem_h,
+                    self.stem_w,
+                    &mut self.stage_b[..self.down_h * self.down_w * 32],
                 )?;
             } else {
                 dense_silu(
                     self.kernel,
                     &self.stem,
                     &self.features,
-                    INPUT_H,
-                    INPUT_W,
+                    self.input_h,
+                    self.input_w,
                     &mut self.stage_a,
                 );
                 dense_silu(
                     self.kernel,
                     &self.downsample,
                     &self.stage_a,
-                    16,
-                    128,
-                    &mut self.stage_b[..8 * 64 * 32],
+                    self.stem_h,
+                    self.stem_w,
+                    &mut self.stage_b[..self.down_h * self.down_w * 32],
                 );
             }
         }
@@ -1602,73 +1582,75 @@ impl PairModel {
                 self.kernel,
                 &self.stem,
                 &self.features,
-                INPUT_H,
-                INPUT_W,
+                self.input_h,
+                self.input_w,
                 &mut self.stage_a,
             );
             dense_silu(
                 self.kernel,
                 &self.downsample,
                 &self.stage_a,
-                16,
-                128,
-                &mut self.stage_b[..8 * 64 * 32],
+                self.stem_h,
+                self.stem_w,
+                &mut self.stage_b[..self.down_h * self.down_w * 32],
             );
         }
         depthwise_silu(
             self.kernel,
             &self.detail_dw,
-            &self.stage_b[..8 * 64 * 32],
-            8,
-            64,
-            &mut self.stage_a[..8 * 64 * 32],
+            &self.stage_b[..self.down_h * self.down_w * 32],
+            self.down_h,
+            self.down_w,
+            &mut self.stage_a[..self.down_h * self.down_w * 32],
         );
         dense_silu(
             self.kernel,
             &self.detail_pw,
-            &self.stage_a[..8 * 64 * 32],
-            8,
-            64,
-            &mut self.stage_b[..8 * 64 * 32],
+            &self.stage_a[..self.down_h * self.down_w * 32],
+            self.down_h,
+            self.down_w,
+            &mut self.stage_b[..self.down_h * self.down_w * 32],
         );
         depthwise_silu(
             self.kernel,
             &self.vertical_dw,
-            &self.stage_b[..8 * 64 * 32],
-            8,
-            64,
-            &mut self.stage_a[..4 * 64 * 32],
+            &self.stage_b[..self.down_h * self.down_w * 32],
+            self.down_h,
+            self.down_w,
+            &mut self.stage_a[..self.final_h * self.final_w * 32],
         );
         dense_silu(
             self.kernel,
             &self.vertical_pw,
-            &self.stage_a[..4 * 64 * 32],
-            4,
-            64,
-            &mut self.stage_b[..4 * 64 * 48],
+            &self.stage_a[..self.final_h * self.final_w * 32],
+            self.final_h,
+            self.final_w,
+            &mut self.stage_b[..self.final_h * self.final_w * 48],
         );
         depthwise_silu(
             self.kernel,
             &self.context_dw,
-            &self.stage_b[..4 * 64 * 48],
-            4,
-            64,
-            &mut self.stage_a[..4 * 64 * 48],
+            &self.stage_b[..self.final_h * self.final_w * 48],
+            self.final_h,
+            self.final_w,
+            &mut self.stage_a[..self.final_h * self.final_w * 48],
         );
         dense_silu(
             self.kernel,
             &self.context_pw,
-            &self.stage_a[..4 * 64 * 48],
-            4,
-            64,
-            &mut self.stage_b[..4 * 64 * 48],
+            &self.stage_a[..self.final_h * self.final_w * 48],
+            self.final_h,
+            self.final_w,
+            &mut self.stage_b[..self.final_h * self.final_w * 48],
         );
         gated_pool(
-            &self.stage_b[..4 * 64 * 48],
+            &self.stage_b[..self.final_h * self.final_w * 48],
             &self.mask_weight,
             self.mask_bias,
             &mut self.width_sum,
             &mut self.pooled,
+            self.final_h,
+            self.final_w,
         );
         linear_silu(
             self.kernel,
@@ -1681,215 +1663,25 @@ impl PairModel {
 }
 
 fn require_architecture(
-    model: &UnifiedModel,
-    expected_nodes: usize,
-    expected_convs: usize,
+    model: &Model,
+    _expected_nodes: usize,
+    _expected_convs: usize,
     name: &str,
 ) -> Result<()> {
-    let expected_ops: &[&str] = match name {
-        "presence" => &PRESENCE_OPS,
-        "pair matcher" => &PAIR_OPS,
-        _ => return Err(invalid_cpu_graph(format!("unknown architecture {name}"))),
+    let expected = match name {
+        "presence" => ModelType::RoiPresence,
+        "pair matcher" => ModelType::RoiPairMatcher,
+        _ => return Err(invalid_cpu_model(format!("unknown architecture {name}"))),
     };
-    if model
-        .graph
-        .nodes
-        .iter()
-        .map(|node| node.original_op.as_str())
-        .ne(expected_ops.iter().copied())
-    {
-        return Err(invalid_cpu_graph(format!(
-            "unsupported {name} operator sequence"
+    if model.model_type != expected {
+        return Err(invalid_cpu_model(format!(
+            "model type does not match {name} architecture"
         )));
-    }
-    let conv_nodes = model
-        .graph
-        .nodes
-        .iter()
-        .filter(|node| matches!(node.op, Op::Conv2d { .. }))
-        .collect::<Vec<_>>();
-    if model.graph.nodes.len() != expected_nodes || conv_nodes.len() != expected_convs {
-        return Err(invalid_cpu_graph(format!(
-            "unsupported {name} graph: expected {expected_nodes} nodes/{expected_convs} convolutions, got {}/{}",
-            model.graph.nodes.len(),
-            conv_nodes.len()
-        )));
-    }
-    if !fused_attributes_match(&model.graph.nodes, name) {
-        return Err(invalid_cpu_graph(format!(
-            "unsupported {name} operator attributes"
-        )));
-    }
-    type ConvSpec<'a> = (&'a str, [usize; 2], [usize; 2], [usize; 2], usize);
-    let presence_specs: [ConvSpec<'_>; 3] = [
-        ("backbone.0", [2, 2], [2, 2], [1, 1], 1),
-        ("backbone.2", [2, 2], [2, 2], [1, 1], 1),
-        ("presence_head.local", [1, 1], [2, 2], [2, 2], 1),
-    ];
-    let pair_specs: [ConvSpec<'_>; 9] = [
-        ("model.stem.0", [2, 2], [1, 1], [1, 1], 1),
-        ("model.downsample.0", [2, 2], [1, 1], [1, 1], 1),
-        ("model.detail.0", [1, 1], [1, 1], [1, 1], 32),
-        ("model.detail.3", [1, 1], [0, 0], [1, 1], 1),
-        ("model.vertical_downsample.0", [2, 1], [1, 1], [1, 1], 32),
-        ("model.vertical_downsample.3", [1, 1], [0, 0], [1, 1], 1),
-        ("model.context.0", [1, 1], [1, 1], [1, 1], 48),
-        ("model.context.3", [1, 1], [0, 0], [1, 1], 1),
-        ("model.text_mask", [1, 1], [0, 0], [1, 1], 1),
-    ];
-    let specs: &[ConvSpec<'_>] = if name == "presence" {
-        &presence_specs
-    } else {
-        &pair_specs
-    };
-    for (node, (target, expected_stride, expected_padding, expected_dilation, expected_groups)) in
-        conv_nodes.into_iter().zip(specs)
-    {
-        let Op::Conv2d {
-            stride,
-            padding,
-            dilation,
-            groups,
-        } = node.op
-        else {
-            unreachable!();
-        };
-        let weight_target = node
-            .inputs
-            .get(1)
-            .and_then(|id| model.tensors.get(id.0))
-            .and_then(|info| info.target.as_deref());
-        let bias_target = node
-            .inputs
-            .get(2)
-            .and_then(|id| model.tensors.get(id.0))
-            .and_then(|info| info.target.as_deref());
-        if stride != *expected_stride
-            || padding != *expected_padding
-            || dilation != *expected_dilation
-            || groups != *expected_groups
-            || weight_target.and_then(|value| value.strip_suffix(".weight")) != Some(*target)
-            || bias_target.and_then(|value| value.strip_suffix(".bias")) != Some(*target)
-        {
-            return Err(invalid_cpu_graph(format!(
-                "convolution {} does not match the {name} export",
-                node.name
-            )));
-        }
     }
     Ok(())
 }
 
-fn fused_attributes_match(nodes: &[crate::ir::graph::Node], name: &str) -> bool {
-    match name {
-        "presence" => {
-            reduce_max_matches(&nodes[6].op, &[1])
-                && greater_matches(&nodes[7].op, 1e-8)
-                && cast_f32_matches(&nodes[8].op)
-                && avg_pool_matches(&nodes[9].op, [4, 4], [4, 4], [0, 0], true)
-                && greater_matches(&nodes[10].op, 0.5)
-                && cast_f32_matches(&nodes[11].op)
-                && greater_matches(&nodes[12].op, 0.5)
-                && cast_f32_matches(&nodes[13].op)
-                && avg_pool_matches(&nodes[14].op, [5, 5], [1, 1], [2, 2], false)
-                && mul_matches(&nodes[15].op, None)
-                && avg_pool_matches(&nodes[16].op, [5, 5], [1, 1], [2, 2], false)
-                && clamp_matches(&nodes[17].op, 1e-6)
-                && greater_matches(&nodes[19].op, 0.5)
-                && masked_fill_matches(&nodes[21].op, f32::MIN)
-                && reduce_max_matches(&nodes[22].op, &[1, 2, 3])
-                && clamp_matches(&nodes[23].op, -10_000.0)
-                && add_matches(&nodes[25].op, Some(0.5))
-                && mul_matches(&nodes[26].op, None)
-                && add_matches(&nodes[27].op, None)
-        }
-        "pair matcher" => {
-            avg_pool_matches(&nodes[1].op, [5, 5], [1, 1], [2, 2], false)
-                && add_matches(&nodes[2].op, None)
-                && mul_matches(&nodes[3].op, Some(0.5))
-                && cat_matches(&nodes[7].op, 1)
-                && mul_matches(&nodes[26].op, Some(0.75))
-                && add_matches(&nodes[27].op, Some(0.25))
-                && mul_matches(&nodes[28].op, None)
-                && reduce_mean_matches(&nodes[29].op, &[2, 3])
-                && reduce_max_matches(&nodes[30].op, &[2, 3])
-                && reduce_mean_matches(&nodes[31].op, &[2])
-                && reduce_max_matches(&nodes[32].op, &[-1])
-                && cat_matches(&nodes[33].op, 1)
-                && squeeze_matches(&nodes[37].op, 1)
-        }
-        _ => false,
-    }
-}
-
-fn avg_pool_matches(
-    op: &Op,
-    expected_kernel: [usize; 2],
-    expected_stride: [usize; 2],
-    expected_padding: [usize; 2],
-    expected_count_include_pad: bool,
-) -> bool {
-    matches!(
-        op,
-        Op::AvgPool2d {
-            kernel,
-            stride,
-            padding,
-            ceil_mode: false,
-            count_include_pad,
-        } if *kernel == expected_kernel
-            && *stride == expected_stride
-            && *padding == expected_padding
-            && *count_include_pad == expected_count_include_pad
-    )
-}
-
-fn reduce_max_matches(op: &Op, expected: &[isize]) -> bool {
-    matches!(op, Op::ReduceMax { axes } if axes == expected)
-}
-
-fn reduce_mean_matches(op: &Op, expected: &[isize]) -> bool {
-    matches!(op, Op::ReduceMean { axes } if axes == expected)
-}
-
-fn greater_matches(op: &Op, expected: f32) -> bool {
-    matches!(op, Op::GreaterThan { value } if *value == expected)
-}
-
-fn clamp_matches(op: &Op, expected: f32) -> bool {
-    matches!(op, Op::ClampMin { value } if *value == expected)
-}
-
-fn masked_fill_matches(op: &Op, expected: f32) -> bool {
-    matches!(op, Op::MaskedFill { value } if *value == expected)
-}
-
-fn cast_f32_matches(op: &Op) -> bool {
-    matches!(
-        op,
-        Op::Cast {
-            dtype: DType::Float32
-        }
-    )
-}
-
-fn add_matches(op: &Op, expected: Option<f32>) -> bool {
-    matches!(op, Op::Add { alpha, value } if *alpha == 1.0 && *value == expected)
-}
-
-fn mul_matches(op: &Op, expected: Option<f32>) -> bool {
-    matches!(op, Op::Mul { value } if *value == expected)
-}
-
-fn cat_matches(op: &Op, expected: isize) -> bool {
-    matches!(op, Op::Cat { dim } if *dim == expected)
-}
-
-fn squeeze_matches(op: &Op, expected: isize) -> bool {
-    matches!(op, Op::Squeeze { dim } if *dim == expected)
-}
-
-fn parameter(model: &UnifiedModel, target: &str, shape: &[usize]) -> Result<Vec<f32>> {
+fn parameter(model: &Model, target: &str, shape: &[usize]) -> Result<Vec<f32>> {
     let info = model
         .tensors
         .iter()
@@ -1897,14 +1689,14 @@ fn parameter(model: &UnifiedModel, target: &str, shape: &[usize]) -> Result<Vec<
             matches!(info.kind, TensorKind::Parameter | TensorKind::Buffer)
                 && info.target.as_deref() == Some(target)
         })
-        .ok_or_else(|| invalid_cpu_graph(format!("missing parameter {target}")))?;
+        .ok_or_else(|| invalid_cpu_model(format!("missing parameter {target}")))?;
     validate_parameter(info, target, shape)?;
     let weight = info
         .weight
-        .ok_or_else(|| invalid_cpu_graph(format!("parameter {target} has no data")))?;
+        .ok_or_else(|| invalid_cpu_model(format!("parameter {target} has no data")))?;
     let bytes = model.weights.slice(weight.offset, weight.byte_length)?;
     if bytes.len() % 4 != 0 {
-        return Err(invalid_cpu_graph(format!(
+        return Err(invalid_cpu_model(format!(
             "parameter {target} byte length is not float32-aligned"
         )));
     }
@@ -1914,7 +1706,7 @@ fn parameter(model: &UnifiedModel, target: &str, shape: &[usize]) -> Result<Vec<
         .collect())
 }
 
-fn scalar_parameter(model: &UnifiedModel, target: &str) -> Result<f32> {
+fn scalar_parameter(model: &Model, target: &str) -> Result<f32> {
     let info = model
         .tensors
         .iter()
@@ -1922,7 +1714,7 @@ fn scalar_parameter(model: &UnifiedModel, target: &str) -> Result<f32> {
             matches!(info.kind, TensorKind::Parameter | TensorKind::Buffer)
                 && info.target.as_deref() == Some(target)
         })
-        .ok_or_else(|| invalid_cpu_graph(format!("missing parameter {target}")))?;
+        .ok_or_else(|| invalid_cpu_model(format!("missing parameter {target}")))?;
     if !info.shape.is_empty() && info.shape != [1] {
         return Err(RtError::InvalidTensor {
             tensor: target.into(),
@@ -1933,7 +1725,7 @@ fn scalar_parameter(model: &UnifiedModel, target: &str) -> Result<f32> {
     values
         .first()
         .copied()
-        .ok_or_else(|| invalid_cpu_graph(format!("scalar parameter {target} is empty")))
+        .ok_or_else(|| invalid_cpu_model(format!("scalar parameter {target} is empty")))
 }
 
 fn validate_parameter(info: &TensorInfo, target: &str, shape: &[usize]) -> Result<()> {
@@ -1949,8 +1741,17 @@ fn validate_parameter(info: &TensorInfo, target: &str, shape: &[usize]) -> Resul
     Ok(())
 }
 
-fn invalid_cpu_graph(message: impl Into<String>) -> RtError {
-    RtError::InvalidGraph(format!("CPU ROI backend: {}", message.into()))
+fn invalid_cpu_model(message: impl Into<String>) -> RtError {
+    RtError::InvalidModel(format!("CPU ROI backend: {}", message.into()))
+}
+
+fn model_input_hw(model: &Model) -> Result<(usize, usize)> {
+    let info = model
+        .input_info()
+        .into_iter()
+        .next()
+        .ok_or_else(|| invalid_cpu_model("model has no input"))?;
+    Ok((info.shape[2], info.shape[3]))
 }
 
 fn nchw_bytes_to_nhwc(
@@ -1996,50 +1797,57 @@ fn pair_features(
     delta: &mut [f32],
     integral: &mut [f32],
     output: &mut [f32],
+    height: usize,
+    width: usize,
 ) {
-    debug_assert_eq!(left.len(), INPUT_H * INPUT_W * 3);
+    debug_assert_eq!(left.len(), height * width * 3);
     debug_assert_eq!(right.len(), left.len());
-    debug_assert_eq!(delta.len(), left.len());
-    debug_assert_eq!(integral.len(), (INPUT_H + 1) * (INPUT_W + 1) * 3);
-    debug_assert_eq!(output.len(), INPUT_H * INPUT_W * 9);
+    debug_assert_eq!(delta.len(), height * width);
+    debug_assert_eq!(integral.len(), (height + 1) * (width + 1));
+    debug_assert_eq!(output.len(), height * width * 3);
 
-    for index in 0..delta.len() {
-        delta[index] = left[index] - right[index];
+    const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
+    const STD: [f32; 3] = [0.229, 0.224, 0.225];
+    const VALUE_MEAN: f32 = (0.485 + 0.456 + 0.406) / 3.0;
+    const VALUE_STD: f32 = (0.229 + 0.224 + 0.225) / 3.0;
+    for (index, (left, right)) in left.chunks_exact(3).zip(right.chunks_exact(3)).enumerate() {
+        let left_value = (left[0] * STD[0] + MEAN[0])
+            .max(left[1] * STD[1] + MEAN[1])
+            .max(left[2] * STD[2] + MEAN[2]);
+        let right_value = (right[0] * STD[0] + MEAN[0])
+            .max(right[1] * STD[1] + MEAN[1])
+            .max(right[2] * STD[2] + MEAN[2]);
+        delta[index] = (left_value - right_value) / VALUE_STD;
+        output[index * 3] = ((left_value + right_value) * 0.5 - VALUE_MEAN) / VALUE_STD;
+        output[index * 3 + 1] = delta[index].abs();
     }
     integral.fill(0.0);
-    let integral_w = INPUT_W + 1;
-    for y in 0..INPUT_H {
-        let mut row_sum = [0.0f32; 3];
-        for x in 0..INPUT_W {
-            let pixel = (y * INPUT_W + x) * 3;
-            let above = (y * integral_w + x + 1) * 3;
-            let target = ((y + 1) * integral_w + x + 1) * 3;
-            for channel in 0..3 {
-                row_sum[channel] += delta[pixel + channel];
-                integral[target + channel] = integral[above + channel] + row_sum[channel];
-            }
+    let integral_w = width + 1;
+    for y in 0..height {
+        let mut row_sum = 0.0f32;
+        for x in 0..width {
+            let pixel = y * width + x;
+            let above = y * integral_w + x + 1;
+            let target = (y + 1) * integral_w + x + 1;
+            row_sum += delta[pixel];
+            integral[target] = integral[above] + row_sum;
         }
     }
-    for y in 0..INPUT_H {
+    for y in 0..height {
         let y0 = y.saturating_sub(2);
-        let y1 = (y + 3).min(INPUT_H);
-        for x in 0..INPUT_W {
+        let y1 = (y + 3).min(height);
+        for x in 0..width {
             let x0 = x.saturating_sub(2);
-            let x1 = (x + 3).min(INPUT_W);
+            let x1 = (x + 3).min(width);
             let count = ((y1 - y0) * (x1 - x0)) as f32;
-            let pixel = (y * INPUT_W + x) * 3;
-            let destination = (y * INPUT_W + x) * 9;
-            for channel in 0..3 {
-                let a = ((y1 * integral_w + x1) * 3) + channel;
-                let b = ((y0 * integral_w + x1) * 3) + channel;
-                let c = ((y1 * integral_w + x0) * 3) + channel;
-                let d = ((y0 * integral_w + x0) * 3) + channel;
-                let background = (integral[a] - integral[b] - integral[c] + integral[d]) / count;
-                output[destination + channel] =
-                    0.5 * (left[pixel + channel] + right[pixel + channel]);
-                output[destination + 3 + channel] = delta[pixel + channel].abs();
-                output[destination + 6 + channel] = (delta[pixel + channel] - background).abs();
-            }
+            let pixel = y * width + x;
+            let destination = pixel * 3;
+            let a = y1 * integral_w + x1;
+            let b = y0 * integral_w + x1;
+            let c = y1 * integral_w + x0;
+            let d = y0 * integral_w + x0;
+            let background = (integral[a] - integral[b] - integral[c] + integral[d]) / count;
+            output[destination + 2] = (delta[pixel] - background).abs();
         }
     }
 }
@@ -2080,7 +1888,7 @@ fn dense_silu(
 
 #[cfg(not(target_arch = "aarch64"))]
 fn dense_linear(
-    kind: KernelKind,
+    _kind: KernelKind,
     conv: &DenseConv,
     input: &[f32],
     input_h: usize,
@@ -2088,13 +1896,7 @@ fn dense_linear(
     output: &mut [f32],
 ) {
     debug_assert_eq!(conv.out_channels, 1);
-    match kind {
-        #[cfg(target_arch = "x86_64")]
-        KernelKind::Avx2 => unsafe {
-            simd::x86_64::dense_single(conv, input, input_h, input_w, output);
-        },
-        KernelKind::Scalar => dense_scalar::<false>(conv, input, input_h, input_w, output),
-    }
+    dense_scalar::<false>(conv, input, input_h, input_w, output)
 }
 
 fn dense_scalar<const SILU: bool>(
@@ -2198,20 +2000,20 @@ fn gated_pool(
     mask_bias: f32,
     width_sum: &mut [f32],
     output: &mut [f32],
+    height: usize,
+    width: usize,
 ) {
     const CHANNELS: usize = 48;
-    const HEIGHT: usize = 4;
-    const WIDTH: usize = 64;
-    debug_assert_eq!(input.len(), HEIGHT * WIDTH * CHANNELS);
+    debug_assert_eq!(input.len(), height * width * CHANNELS);
     debug_assert_eq!(mask_weight.len(), CHANNELS);
-    debug_assert_eq!(width_sum.len(), WIDTH * CHANNELS);
+    debug_assert_eq!(width_sum.len(), width * CHANNELS);
     debug_assert_eq!(output.len(), CHANNELS * 3);
     output[..CHANNELS].fill(0.0);
     output[CHANNELS..CHANNELS * 2].fill(f32::NEG_INFINITY);
     width_sum.fill(0.0);
-    for y in 0..HEIGHT {
-        for x in 0..WIDTH {
-            let base = (y * WIDTH + x) * CHANNELS;
+    for y in 0..height {
+        for x in 0..width {
+            let base = (y * width + x) * CHANNELS;
             let mut mask = mask_bias;
             for channel in 0..CHANNELS {
                 mask = input[base + channel].mul_add(mask_weight[channel], mask);
@@ -2226,10 +2028,10 @@ fn gated_pool(
         }
     }
     for channel in 0..CHANNELS {
-        output[channel] /= (HEIGHT * WIDTH) as f32;
+        output[channel] /= (height * width) as f32;
         let mut width_peak = f32::NEG_INFINITY;
-        for x in 0..WIDTH {
-            width_peak = width_peak.max(width_sum[x * CHANNELS + channel] / HEIGHT as f32);
+        for x in 0..width {
+            width_peak = width_peak.max(width_sum[x * CHANNELS + channel] / height as f32);
         }
         output[CHANNELS * 2 + channel] = width_peak;
     }
@@ -2573,26 +2375,27 @@ mod simd {
         pub(crate) unsafe fn presence_head(
             conv: &DenseConv,
             input: &[f32],
+            input_h: usize,
+            input_w: usize,
             padded: &mut [f32],
             output: &mut [f32],
         ) {
             const CHANNELS: usize = 32;
-            const INPUT_H: usize = 8;
-            const INPUT_W: usize = 64;
-            const PADDED_W: usize = 68;
+            let padded_w = input_w + 4;
             debug_assert_eq!(conv.in_channels, CHANNELS);
             debug_assert_eq!(conv.out_channels, 1);
-            debug_assert_eq!(input.len(), INPUT_H * INPUT_W * CHANNELS);
-            debug_assert_eq!(padded.len(), 12 * PADDED_W * CHANNELS);
-            debug_assert_eq!(output.len(), INPUT_H * INPUT_W);
-            for y in 0..INPUT_H {
-                let source = &input[y * INPUT_W * CHANNELS..(y + 1) * INPUT_W * CHANNELS];
-                let destination_start = ((y + 2) * PADDED_W + 2) * CHANNELS;
+            debug_assert_eq!(input.len(), input_h * input_w * CHANNELS);
+            debug_assert_eq!(padded.len(), (input_h + 4) * padded_w * CHANNELS);
+            debug_assert_eq!(output.len(), input_h * input_w);
+            padded.fill(0.0);
+            for y in 0..input_h {
+                let source = &input[y * input_w * CHANNELS..(y + 1) * input_w * CHANNELS];
+                let destination_start = ((y + 2) * padded_w + 2) * CHANNELS;
                 padded[destination_start..destination_start + source.len()].copy_from_slice(source);
             }
             unsafe {
-                for y in 0..INPUT_H {
-                    for x in 0..INPUT_W {
+                for y in 0..input_h {
+                    for x in 0..input_w {
                         let mut sum0 = vdupq_n_f32(0.0);
                         let mut sum1 = vdupq_n_f32(0.0);
                         let mut sum2 = vdupq_n_f32(0.0);
@@ -2602,13 +2405,13 @@ mod simd {
                         let mut sum6 = vdupq_n_f32(0.0);
                         let mut sum7 = vdupq_n_f32(0.0);
                         let mut sum8 = vdupq_n_f32(0.0);
-                        let input0 = padded.as_ptr().add((y * PADDED_W + x) * CHANNELS);
+                        let input0 = padded.as_ptr().add((y * padded_w + x) * CHANNELS);
                         let input1 = input0.add(2 * CHANNELS);
                         let input2 = input0.add(4 * CHANNELS);
-                        let input3 = input0.add(2 * PADDED_W * CHANNELS);
+                        let input3 = input0.add(2 * padded_w * CHANNELS);
                         let input4 = input3.add(2 * CHANNELS);
                         let input5 = input3.add(4 * CHANNELS);
-                        let input6 = input0.add(4 * PADDED_W * CHANNELS);
+                        let input6 = input0.add(4 * padded_w * CHANNELS);
                         let input7 = input6.add(2 * CHANNELS);
                         let input8 = input6.add(4 * CHANNELS);
                         for channel in (0..CHANNELS).step_by(4) {
@@ -2666,7 +2469,7 @@ mod simd {
                             vaddq_f32(sum01, sum23),
                             vaddq_f32(vaddq_f32(sum45, sum67), sum8),
                         );
-                        output[y * INPUT_W + x] = conv.bias[0] + vaddvq_f32(sum);
+                        output[y * input_w + x] = conv.bias[0] + vaddvq_f32(sum);
                     }
                 }
             }

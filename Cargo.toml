@@ -14,6 +14,7 @@ half = "2.4"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+safetensors = "0.8"
 thiserror = "2.0"
 naga = { version = "29.0.4", optional = true, features = ["wgsl-in"] }
 wgpu-types = { version = "29.0.4", optional = true }

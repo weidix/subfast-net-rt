@@ -5,11 +5,36 @@ mod support;
 use subfast_net_rt::backend::Backend;
 use subfast_net_rt::backend::cpu::{CpuBackend, CpuExecutable};
 use subfast_net_rt::backend::gpu::{GpuBackend, GpuExecutable};
-use subfast_net_rt::model::UnifiedModel;
+use subfast_net_rt::model::Model;
 
-use support::{deterministic_input, packed_input, synthetic_pair_model, synthetic_presence_model};
+use support::{
+    deterministic_input, deterministic_input_with_shape, deterministic_pair_input, packed_input,
+    packed_input_with_shape, packed_pair_input, synthetic_pair_model,
+    synthetic_pair_model_with_shape, synthetic_presence_model, synthetic_presence_model_with_shape,
+};
 
 const MIXED_BATCH_SIZES: [usize; 5] = [32, 1, 17, 0, 32];
+
+#[test]
+fn dynamic_dimensions_match_cpu_on_gpu() {
+    for (model, input_count) in [
+        (synthetic_presence_model_with_shape([1, 3, 48, 320]), 1usize),
+        (synthetic_pair_model_with_shape([1, 3, 96, 320]), 2usize),
+    ] {
+        let shape = model.input_info()[0].shape.clone();
+        let inputs = (0..input_count)
+            .map(|index| deterministic_input_with_shape(&shape, 0x3141_5926 ^ index as u32))
+            .collect::<Vec<_>>();
+        let mut cpu = CpuBackend.compile(&model).unwrap();
+        let expected = cpu.run_scalar(&inputs).unwrap();
+        let mut gpu = GpuBackend::with_max_batch_size(1)
+            .unwrap()
+            .compile(&model)
+            .unwrap();
+        assert_close("dynamic shape", gpu.run_scalar(&inputs).unwrap(), expected);
+        assert_eq!(gpu.input_shapes()[0], shape);
+    }
+}
 
 #[test]
 fn metal_or_vulkan_matches_cpu_for_both_roi_models() {
@@ -88,8 +113,8 @@ fn metal_or_vulkan_matches_cpu_for_both_roi_models() {
     );
 
     let pair = synthetic_pair_model();
-    let left = deterministic_input(0x1357_9bdf);
-    let right = deterministic_input(0x2468_ace0);
+    let left = deterministic_pair_input(0x1357_9bdf);
+    let right = deterministic_pair_input(0x2468_ace0);
     let mut pair_cpu = CpuBackend.compile(&pair).unwrap();
     let expected = pair_cpu.run_scalar(&[left.clone(), right.clone()]).unwrap();
     let mut pair_gpu = GpuBackend::with_max_batch_size(32)
@@ -105,8 +130,8 @@ fn metal_or_vulkan_matches_cpu_for_both_roi_models() {
         actual,
         pair_gpu
             .run_scalar(&[
-                deterministic_input(0x1357_9bdf),
-                deterministic_input(0x2468_ace0),
+                deterministic_pair_input(0x1357_9bdf),
+                deterministic_pair_input(0x2468_ace0),
             ])
             .unwrap()
     );
@@ -119,20 +144,26 @@ fn metal_or_vulkan_matches_cpu_for_both_roi_models() {
         .map(|(left_seed, right_seed)| {
             pair_cpu
                 .run_scalar(&[
-                    deterministic_input(*left_seed),
-                    deterministic_input(right_seed),
+                    deterministic_pair_input(*left_seed),
+                    deterministic_pair_input(right_seed),
                 ])
                 .unwrap()
         })
         .collect::<Vec<_>>();
     let pair_actual = pair_gpu
-        .run_batch_scalar(&[packed_input(&left_seeds), packed_input(&right_seeds)])
+        .run_batch_scalar(&[
+            packed_pair_input(&left_seeds),
+            packed_pair_input(&right_seeds),
+        ])
         .unwrap();
     assert_batch_close("pair", &pair_actual, &pair_expected);
     let mut pair_into = [0.0; 3];
     pair_gpu
         .run_batch_scalar_into(
-            &[packed_input(&left_seeds), packed_input(&right_seeds)],
+            &[
+                packed_pair_input(&left_seeds),
+                packed_pair_input(&right_seeds),
+            ],
             &mut pair_into,
         )
         .unwrap();
@@ -140,12 +171,12 @@ fn metal_or_vulkan_matches_cpu_for_both_roi_models() {
     assert_pair_mixed_batches(&mut pair_cpu, &mut pair_gpu);
     assert!(
         pair_gpu
-            .run_batch_scalar(std::slice::from_ref(&packed_input(&[1])))
+            .run_batch_scalar(std::slice::from_ref(&packed_pair_input(&[1])))
             .is_err()
     );
     assert!(
         pair_gpu
-            .run_batch_scalar(&[packed_input(&[1, 2]), packed_input(&[3])])
+            .run_batch_scalar(&[packed_pair_input(&[1, 2]), packed_pair_input(&[3])])
             .is_err()
     );
 }
@@ -169,7 +200,10 @@ fn assert_pair_mixed_batches(cpu: &mut CpuExecutable, gpu: &mut GpuExecutable) {
     for (run, batch_size) in MIXED_BATCH_SIZES.into_iter().enumerate() {
         let left_seeds = batch_seeds(batch_size, 1, run);
         let right_seeds = batch_seeds(batch_size, 2, run);
-        let inputs = [packed_input(&left_seeds), packed_input(&right_seeds)];
+        let inputs = [
+            packed_pair_input(&left_seeds),
+            packed_pair_input(&right_seeds),
+        ];
         let expected = cpu.run_batch_scalar(&inputs).unwrap();
         let actual = gpu.run_batch_scalar(&inputs).unwrap();
         assert_batch_close(
@@ -201,9 +235,13 @@ fn configured_real_models_match_metal_or_vulkan() {
             eprintln!("skipping GPU fixture; set {variable}");
             continue;
         };
-        let model = UnifiedModel::load(path.join("model.json"), path.join("weights.bin")).unwrap();
+        let model = Model::load(&path).unwrap();
+        let shape = model.input_info()[0].shape.clone();
         let inputs = (0..input_count)
-            .map(|index| deterministic_input(0x4242_1000 ^ (index as u32 * 0x1020_3040)))
+            .map(|index| {
+                let seed = 0x4242_1000 ^ (index as u32 * 0x1020_3040);
+                deterministic_input_with_shape(&shape, seed)
+            })
             .collect::<Vec<_>>();
         let mut cpu = CpuBackend.compile(&model).unwrap();
         let expected = cpu.run_scalar(&inputs).unwrap();
@@ -224,17 +262,58 @@ fn configured_real_models_match_metal_or_vulkan() {
             .map(|sample| {
                 let sample_inputs = seed_sets
                     .iter()
-                    .map(|seeds| deterministic_input(seeds[sample]))
+                    .map(|seeds| deterministic_input_with_shape(&shape, seeds[sample]))
                     .collect::<Vec<_>>();
                 cpu.run_scalar(&sample_inputs).unwrap()
             })
             .collect::<Vec<_>>();
         let packed = seed_sets
             .iter()
-            .map(|seeds| packed_input(seeds))
+            .map(|seeds| packed_input_with_shape(&shape, seeds))
             .collect::<Vec<_>>();
         let batch_actual = gpu.run_batch_scalar(&packed).unwrap();
         assert_batch_close(variable, &batch_actual, &batch_expected);
+    }
+}
+
+#[test]
+fn configured_real_models_use_dimensions_from_config() {
+    for (variable, dimensions, input_count) in [
+        ("SUBFAST_RT_PRESENCE_DIR", [48u64, 320], 1usize),
+        ("SUBFAST_RT_PAIR_DIR", [96u64, 320], 2usize),
+    ] {
+        let Some(source) = std::env::var_os(variable).map(std::path::PathBuf::from) else {
+            eprintln!("skipping dynamic GPU fixture; set {variable}");
+            continue;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::copy(
+            source.join("model.safetensors"),
+            temp.path().join("model.safetensors"),
+        )
+        .unwrap();
+        let mut config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(source.join("config.json")).unwrap()).unwrap();
+        for tensor in config["input"]["tensors"].as_array_mut().unwrap() {
+            tensor["shape"][2] = dimensions[0].into();
+            tensor["shape"][3] = dimensions[1].into();
+        }
+        std::fs::write(
+            temp.path().join("config.json"),
+            serde_json::to_vec_pretty(&config).unwrap(),
+        )
+        .unwrap();
+
+        let model = Model::load(temp.path()).unwrap();
+        let shape = model.input_info()[0].shape.clone();
+        assert_eq!(shape[2..], dimensions.map(|value| value as usize));
+        let inputs = (0..input_count)
+            .map(|index| deterministic_input_with_shape(&shape, 0x4242_1000 ^ index as u32))
+            .collect::<Vec<_>>();
+        let mut cpu = CpuBackend.compile(&model).unwrap();
+        let expected = cpu.run_scalar(&inputs).unwrap();
+        let mut gpu = GpuBackend::default().compile(&model).unwrap();
+        assert_close(variable, gpu.run_scalar(&inputs).unwrap(), expected);
     }
 }
 

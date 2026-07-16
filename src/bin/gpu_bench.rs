@@ -7,7 +7,7 @@ use subfast_net_rt::backend::Backend;
 use subfast_net_rt::backend::cpu::CpuBackend;
 use subfast_net_rt::backend::gpu::GpuBackend;
 use subfast_net_rt::ir::tensor::DType;
-use subfast_net_rt::model::UnifiedModel;
+use subfast_net_rt::model::Model;
 use subfast_net_rt::tensor::Tensor;
 
 #[derive(Debug, Parser)]
@@ -51,10 +51,7 @@ fn run() -> subfast_net_rt::Result<()> {
         ));
     }
 
-    let model = UnifiedModel::load(
-        args.model_path.join("model.json"),
-        args.model_path.join("weights.bin"),
-    )?;
+    let model = Model::load(&args.model_path)?;
     let max_batch = *args.batch_sizes.iter().max().expect("validated above");
     let mut cpu = CpuBackend.compile(&model)?;
     let mut gpu = GpuBackend::with_max_batch_size(max_batch)?.compile(&model)?;
@@ -164,16 +161,20 @@ fn time_gpu(
     Ok(start.elapsed())
 }
 
-fn make_inputs(model: &UnifiedModel, batch_size: usize) -> subfast_net_rt::Result<Vec<Tensor>> {
+fn make_inputs(model: &Model, batch_size: usize) -> subfast_net_rt::Result<Vec<Tensor>> {
     model
         .input_info()
         .into_iter()
         .enumerate()
         .map(|(input_index, info)| {
-            if info.dtype != DType::Float32 || info.shape != [1, 3, 32, 256] {
+            if info.dtype != DType::Float32
+                || info.shape.len() != 4
+                || info.shape[0] != 1
+                || info.shape[1] != 3
+            {
                 return Err(subfast_net_rt::RtError::InvalidTensor {
                     tensor: info.name.clone(),
-                    message: format!("expected float32 [1, 3, 32, 256], got {:?}", info.shape),
+                    message: format!("expected float32 [1, 3, H, W], got {:?}", info.shape),
                 });
             }
             let elements = batch_size * info.shape[1..].iter().product::<usize>();
@@ -184,7 +185,9 @@ fn make_inputs(model: &UnifiedModel, batch_size: usize) -> subfast_net_rt::Resul
                     (state >> 8) as f32 * (2.0 / 16_777_216.0) - 1.0
                 })
                 .collect();
-            Tensor::from_f32(vec![batch_size, 3, 32, 256], values)
+            let mut shape = info.shape.clone();
+            shape[0] = batch_size;
+            Tensor::from_f32(shape, values)
         })
         .collect()
 }

@@ -36,10 +36,7 @@ struct LoadedModel {
 impl LoadedModel {
     fn load(path: &std::path::Path, backend: BackendKind) -> subfast_net_rt::Result<Self> {
         ensure_backend_available(backend)?;
-        let model = subfast_net_rt::model::UnifiedModel::load(
-            path.join("model.json"),
-            path.join("weights.bin"),
-        )?;
+        let model = subfast_net_rt::model::Model::load(path)?;
         let input_shapes = model
             .input_info()
             .iter()
@@ -89,7 +86,7 @@ fn ensure_backend_available(backend: BackendKind) -> subfast_net_rt::Result<()> 
 
 #[cfg(feature = "gpu")]
 fn compile_gpu(
-    model: &subfast_net_rt::model::UnifiedModel,
+    model: &subfast_net_rt::model::Model,
 ) -> subfast_net_rt::Result<Box<dyn Executable>> {
     use subfast_net_rt::backend::gpu::GpuBackend;
 
@@ -98,7 +95,7 @@ fn compile_gpu(
 
 #[cfg(not(feature = "gpu"))]
 fn compile_gpu(
-    _model: &subfast_net_rt::model::UnifiedModel,
+    _model: &subfast_net_rt::model::Model,
 ) -> subfast_net_rt::Result<Box<dyn Executable>> {
     Err(gpu_feature_error())
 }

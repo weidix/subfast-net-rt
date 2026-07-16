@@ -1,4 +1,4 @@
-//! Fixed-shape GPU backend for the ROI Presence and Pair Matcher models.
+//! GPU backend for the ROI Presence and Pair Matcher models.
 //!
 //! WGSL compute kernels are compiled through `wgpu-hal` and Naga to Metal on
 //! macOS and Vulkan on the other supported native targets. Input upload,
@@ -11,12 +11,9 @@ use crate::backend::gpu_hal as hal;
 use crate::backend::{Backend, Executable};
 use crate::error::{Result, RtError};
 use crate::ir::tensor::{DType, TensorInfo, TensorKind};
-use crate::model::UnifiedModel;
+use crate::model::Model;
 use crate::tensor::Tensor;
 
-const INPUT_H: usize = 32;
-const INPUT_W: usize = 256;
-const INPUT_ELEMENTS: usize = 3 * INPUT_H * INPUT_W;
 const WORKGROUP_SIZE: usize = 64;
 
 const CONV_SHADER: &str = r#"
@@ -70,6 +67,9 @@ fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {
     let output_elements = p.output_h * p.output_w * p.out_channels;
     let sample = invocation.y;
     let local = invocation.x;
+    if (local >= output_elements) {
+        return;
+    }
     let index = sample * output_elements + local;
     let output_channel = local % p.out_channels;
     let spatial = local / p.out_channels;
@@ -119,6 +119,14 @@ fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {
 "#;
 
 const PRESENCE_HEAD_FINISH_SHADER: &str = r#"
+const INPUT_H: u32 = __INPUT_H__u;
+const INPUT_W: u32 = __INPUT_W__u;
+const REGION_H: u32 = __REGION_H__u;
+const REGION_W: u32 = __REGION_W__u;
+const INPUT_PLANE: u32 = INPUT_H * INPUT_W;
+const INPUT_ELEMENTS: u32 = INPUT_PLANE * 3u;
+const REGION_ELEMENTS: u32 = REGION_H * REGION_W;
+
 struct Params {
     head_bias: f32,
     scale: f32,
@@ -132,10 +140,10 @@ struct Params {
 @group(0) @binding(3) var<storage, read_write> output: array<f32>;
 @group(0) @binding(4) var<uniform> p: Params;
 
-var<workgroup> region: array<f32, 512>;
-var<workgroup> valid_region: array<u32, 512>;
-var<workgroup> horizontal_sum: array<f32, 512>;
-var<workgroup> horizontal_count: array<u32, 512>;
+var<workgroup> region: array<f32, REGION_ELEMENTS>;
+var<workgroup> valid_region: array<u32, REGION_ELEMENTS>;
+var<workgroup> horizontal_sum: array<f32, REGION_ELEMENTS>;
+var<workgroup> horizontal_count: array<u32, REGION_ELEMENTS>;
 var<workgroup> maxima: array<f32, 256>;
 
 @compute @workgroup_size(256)
@@ -144,25 +152,25 @@ fn main(
     @builtin(workgroup_id) workgroup: vec3<u32>,
 ) {
     let sample = workgroup.x;
-    let input_base = sample * 24576u;
-    let feature_base = sample * 16384u;
+    let input_base = sample * INPUT_ELEMENTS;
+    let feature_base = sample * REGION_ELEMENTS * 32u;
 
-    for (var index = local; index < 512u; index += 256u) {
-        let output_y = index / 64u;
-        let output_x = index % 64u;
+    for (var index = local; index < REGION_ELEMENTS; index += 256u) {
+        let output_y = index / REGION_W;
+        let output_x = index % REGION_W;
         var sum = p.head_bias;
         for (var kernel_y = 0u; kernel_y < 3u; kernel_y += 1u) {
             let input_y = i32(output_y + kernel_y * 2u) - 2;
-            if (input_y < 0 || input_y >= 8) {
+            if (input_y < 0 || input_y >= i32(REGION_H)) {
                 continue;
             }
             for (var kernel_x = 0u; kernel_x < 3u; kernel_x += 1u) {
                 let input_x = i32(output_x + kernel_x * 2u) - 2;
-                if (input_x < 0 || input_x >= 64) {
+                if (input_x < 0 || input_x >= i32(REGION_W)) {
                     continue;
                 }
                 let source_base = feature_base
-                    + (u32(input_y) * 64u + u32(input_x)) * 32u;
+                    + (u32(input_y) * REGION_W + u32(input_x)) * 32u;
                 let weight_base = (kernel_y * 3u + kernel_x) * 32u;
                 for (var channel = 0u; channel < 32u; channel += 1u) {
                     sum = fma(
@@ -175,19 +183,19 @@ fn main(
         }
         region[index] = sum;
 
-        let oy = index / 64u;
-        let ox = index % 64u;
+        let oy = index / REGION_W;
+        let ox = index % REGION_W;
         var count = 0u;
         for (var local_y = 0u; local_y < 4u; local_y += 1u) {
             let y = oy * 4u + local_y;
             for (var local_x = 0u; local_x < 4u; local_x += 1u) {
                 let x = ox * 4u + local_x;
-                let pixel = y * 256u + x;
+                let pixel = y * INPUT_W + x;
                 var magnitude = 0.0;
                 for (var channel = 0u; channel < 3u; channel += 1u) {
                     magnitude = max(
                         magnitude,
-                        abs(input[input_base + channel * 8192u + pixel]),
+                        abs(input[input_base + channel * INPUT_PLANE + pixel]),
                     );
                 }
                 count += select(0u, 1u, magnitude > 1e-8);
@@ -197,15 +205,15 @@ fn main(
     }
     workgroupBarrier();
 
-    for (var index = local; index < 512u; index += 256u) {
-        let y = index / 64u;
-        let x = index % 64u;
+    for (var index = local; index < REGION_ELEMENTS; index += 256u) {
+        let y = index / REGION_W;
+        let x = index % REGION_W;
         let x0 = select(x - 2u, 0u, x < 2u);
-        let x1 = min(x + 3u, 64u);
+        let x1 = min(x + 3u, REGION_W);
         var sum = 0.0;
         var count = 0u;
         for (var xx = x0; xx < x1; xx += 1u) {
-            let neighbor = y * 64u + xx;
+            let neighbor = y * REGION_W + xx;
             if (valid_region[neighbor] != 0u) {
                 sum += region[neighbor];
                 count += 1u;
@@ -217,16 +225,16 @@ fn main(
     workgroupBarrier();
 
     var best = -3.402823466e+38;
-    for (var index = local; index < 512u; index += 256u) {
+    for (var index = local; index < REGION_ELEMENTS; index += 256u) {
         if (valid_region[index] != 0u) {
-            let y = index / 64u;
-            let x = index % 64u;
+            let y = index / REGION_W;
+            let x = index % REGION_W;
             let y0 = select(y - 2u, 0u, y < 2u);
-            let y1 = min(y + 3u, 8u);
+            let y1 = min(y + 3u, REGION_H);
             var sum = 0.0;
             var count = 0u;
             for (var yy = y0; yy < y1; yy += 1u) {
-                let neighbor = yy * 64u + x;
+                let neighbor = yy * REGION_W + x;
                 sum += horizontal_sum[neighbor];
                 count += horizontal_count[neighbor];
             }
@@ -249,92 +257,86 @@ fn main(
 "#;
 
 const PAIR_FEATURE_TILED_SHADER: &str = r#"
-const TILE_W: u32 = 32u;
-const TILE_H: u32 = 4u;
-const HALO_W: u32 = 36u;
-const HALO_H: u32 = 8u;
+const INPUT_H: u32 = __INPUT_H__u;
+const INPUT_W: u32 = __INPUT_W__u;
+const INPUT_PLANE: u32 = INPUT_H * INPUT_W;
+const INPUT_ELEMENTS: u32 = INPUT_PLANE * 3u;
 
 @group(0) @binding(0) var<storage, read> left: array<f32>;
 @group(0) @binding(1) var<storage, read> right: array<f32>;
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
 
-var<workgroup> delta_tile: array<f32, 864>;
-var<workgroup> horizontal_tile: array<f32, 768>;
+fn value_channel(red_input: f32, green_input: f32, blue_input: f32) -> f32 {
+    let red = red_input * 0.229 + 0.485;
+    let green = green_input * 0.224 + 0.456;
+    let blue = blue_input * 0.225 + 0.406;
+    return (max(max(red, green), blue) - 0.449) / 0.226;
+}
 
 @compute @workgroup_size(128)
 fn main(
     @builtin(local_invocation_index) local: u32,
     @builtin(workgroup_id) workgroup: vec3<u32>,
 ) {
-    let tile_x = workgroup.x % 8u;
-    let tile_y = workgroup.x / 8u;
     let sample = workgroup.y;
-    let input_base = sample * 24576u;
-
-    for (var index = local; index < 864u; index += 128u) {
-        let channel = index / 288u;
-        let cell = index % 288u;
-        let halo_x = cell % HALO_W;
-        let halo_y = cell / HALO_W;
-        let input_x = i32(tile_x * TILE_W + halo_x) - 2;
-        let input_y = i32(tile_y * TILE_H + halo_y) - 2;
-        var delta = 0.0;
-        if (input_x >= 0 && input_x < 256 && input_y >= 0 && input_y < 32) {
-            let source_index = input_base + channel * 8192u
-                + u32(input_y) * 256u + u32(input_x);
-            delta = left[source_index] - right[source_index];
-        }
-        delta_tile[cell * 3u + channel] = delta;
+    let pixel = workgroup.x * 128u + local;
+    if (pixel >= INPUT_PLANE) {
+        return;
     }
-    workgroupBarrier();
-
-    for (var index = local; index < 768u; index += 128u) {
-        let channel = index % 3u;
-        let cell = index / 3u;
-        let horizontal_x = cell % TILE_W;
-        let horizontal_y = cell / TILE_W;
-        var sum = 0.0;
-        for (var kernel_x = 0u; kernel_x < 5u; kernel_x += 1u) {
-            let tile_index = (horizontal_y * HALO_W + horizontal_x + kernel_x) * 3u
-                + channel;
-            sum += delta_tile[tile_index];
-        }
-        horizontal_tile[index] = sum;
-    }
-    workgroupBarrier();
-
-    let local_y = local / TILE_W;
-    let local_x = local % TILE_W;
-    let y = tile_y * TILE_H + local_y;
-    let x = tile_x * TILE_W + local_x;
-    let pixel = y * 256u + x;
-    let output_base = sample * 73728u + pixel * 9u;
+    let y = pixel / INPUT_W;
+    let x = pixel % INPUT_W;
+    let input_base = sample * INPUT_ELEMENTS;
+    let output_base = sample * INPUT_ELEMENTS + pixel * 3u;
+    let left_value = value_channel(
+        left[input_base + pixel],
+        left[input_base + INPUT_PLANE + pixel],
+        left[input_base + INPUT_PLANE * 2u + pixel],
+    );
+    let right_value = value_channel(
+        right[input_base + pixel],
+        right[input_base + INPUT_PLANE + pixel],
+        right[input_base + INPUT_PLANE * 2u + pixel],
+    );
+    let delta = left_value - right_value;
     let y0 = select(y - 2u, 0u, y < 2u);
-    let y1 = min(y + 3u, 32u);
+    let y1 = min(y + 3u, INPUT_H);
     let x0 = select(x - 2u, 0u, x < 2u);
-    let x1 = min(x + 3u, 256u);
+    let x1 = min(x + 3u, INPUT_W);
     let count = f32((y1 - y0) * (x1 - x0));
-
-    for (var channel = 0u; channel < 3u; channel += 1u) {
-        let source_index = input_base + channel * 8192u + pixel;
-        let left_value = left[source_index];
-        let right_value = right[source_index];
-        let delta = left_value - right_value;
-        var background = 0.0;
-        for (var kernel_y = 0u; kernel_y < 5u; kernel_y += 1u) {
-            let horizontal_index = ((local_y + kernel_y) * TILE_W + local_x) * 3u
-                + channel;
-            background += horizontal_tile[horizontal_index];
+    var background = 0.0;
+    for (var yy = y0; yy < y1; yy += 1u) {
+        for (var xx = x0; xx < x1; xx += 1u) {
+            let neighbor = yy * INPUT_W + xx;
+            background += value_channel(
+                left[input_base + neighbor],
+                left[input_base + INPUT_PLANE + neighbor],
+                left[input_base + INPUT_PLANE * 2u + neighbor],
+            ) - value_channel(
+                right[input_base + neighbor],
+                right[input_base + INPUT_PLANE + neighbor],
+                right[input_base + INPUT_PLANE * 2u + neighbor],
+            );
         }
-        background /= count;
-        output[output_base + channel] = 0.5 * (left_value + right_value);
-        output[output_base + 3u + channel] = abs(delta);
-        output[output_base + 6u + channel] = abs(delta - background);
     }
+    background /= count;
+    output[output_base] = 0.5 * (left_value + right_value);
+    output[output_base + 1u] = abs(delta);
+    output[output_base + 2u] = abs(delta - background);
 }
 "#;
 
 const PAIR_TAIL_SHADER: &str = r#"
+const INPUT_H: u32 = __INPUT_H__u;
+const INPUT_W: u32 = __INPUT_W__u;
+const CHANNELS: u32 = 48u;
+const TILE_H: u32 = 4u;
+const TILE_W: u32 = 16u;
+const TILE_PIXELS: u32 = TILE_H * TILE_W;
+const TILE_COLUMNS: u32 = (INPUT_W + TILE_W - 1u) / TILE_W;
+const TILE_ROWS: u32 = (INPUT_H + TILE_H - 1u) / TILE_H;
+const TILE_COUNT: u32 = TILE_ROWS * TILE_COLUMNS;
+const INPUT_ELEMENTS: u32 = INPUT_H * INPUT_W * CHANNELS;
+
 struct Params {
     mask_bias: f32,
     classifier2_bias: f32,
@@ -350,7 +352,7 @@ struct Params {
 @group(0) @binding(5) var<storage, read_write> output: array<f32>;
 @group(0) @binding(6) var<uniform> p: Params;
 
-var<workgroup> gated_tile: array<f32, 3072>;
+var<workgroup> gated_tile: array<f32, TILE_PIXELS * CHANNELS>;
 var<workgroup> pooled: array<f32, 144>;
 var<workgroup> hidden: array<f32, 32>;
 
@@ -380,44 +382,64 @@ fn main(
     @builtin(workgroup_id) workgroup: vec3<u32>,
 ) {
     let sample = workgroup.y;
-    let input_base = sample * 12288u;
+    let input_base = sample * INPUT_ELEMENTS;
     var sum = 0.0;
     var peak = -3.402823466e+38;
     var width_peak = -3.402823466e+38;
+    var width_sums: array<f32, INPUT_W>;
 
-    for (var tile = 0u; tile < 4u; tile += 1u) {
-        let x = tile * 16u + local % 16u;
-        let y = local / 16u;
-        let pixel_base = input_base + (y * 64u + x) * 48u;
+    for (var tile = 0u; tile < TILE_COUNT; tile += 1u) {
+        let tile_x = tile % TILE_COLUMNS;
+        let tile_y = tile / TILE_COLUMNS;
+        let x = tile_x * TILE_W + local % TILE_W;
+        let y = tile_y * TILE_H + local / TILE_W;
+        let pixel_base = input_base + (y * INPUT_W + x) * CHANNELS;
         var mask = p.mask_bias;
-        for (var channel = 0u; channel < 48u; channel += 1u) {
-            mask = fma(input[pixel_base + channel], mask_weight[channel], mask);
+        let is_active = x < INPUT_W && y < INPUT_H;
+        if (is_active) {
+            for (var channel = 0u; channel < CHANNELS; channel += 1u) {
+                mask = fma(input[pixel_base + channel], mask_weight[channel], mask);
+            }
         }
         let gate = 0.25 + 0.75 / (1.0 + fast_exp(-mask));
-        for (var channel = 0u; channel < 48u; channel += 1u) {
-            gated_tile[local * 48u + channel] = input[pixel_base + channel] * gate;
+        for (var channel = 0u; channel < CHANNELS; channel += 1u) {
+            var value = 0.0;
+            if (is_active) {
+                value = input[pixel_base + channel] * gate;
+            }
+            gated_tile[local * CHANNELS + channel] = value;
         }
         workgroupBarrier();
 
-        if (local < 48u) {
-            for (var tile_x = 0u; tile_x < 16u; tile_x += 1u) {
+        if (local < CHANNELS) {
+            for (var column = 0u; column < TILE_W; column += 1u) {
                 var width_sum = 0.0;
-                for (var tile_y = 0u; tile_y < 4u; tile_y += 1u) {
-                    let value = gated_tile[(tile_y * 16u + tile_x) * 48u + local];
-                    sum += value;
-                    width_sum += value;
-                    peak = max(peak, value);
+                for (var tile_y = 0u; tile_y < TILE_H; tile_y += 1u) {
+                    let value = gated_tile[(tile_y * TILE_W + column) * CHANNELS + local];
+                    let actual_x = tile_x * TILE_W + column;
+                    let actual_y = (tile / TILE_COLUMNS) * TILE_H + tile_y;
+                    if (actual_x < INPUT_W && actual_y < INPUT_H) {
+                        sum += value;
+                        width_sum += value;
+                        peak = max(peak, value);
+                    }
                 }
-                width_peak = max(width_peak, width_sum * 0.25);
+                let actual_x = tile_x * TILE_W + column;
+                if (actual_x < INPUT_W) {
+                    width_sums[actual_x] += width_sum;
+                }
             }
         }
         workgroupBarrier();
     }
 
-    if (local < 48u) {
-        pooled[local] = sum / 256.0;
-        pooled[48u + local] = peak;
-        pooled[96u + local] = width_peak;
+    if (local < CHANNELS) {
+        for (var x = 0u; x < INPUT_W; x += 1u) {
+            width_peak = max(width_peak, width_sums[x] / f32(INPUT_H));
+        }
+        pooled[local] = sum / f32(INPUT_H * INPUT_W);
+        pooled[CHANNELS + local] = peak;
+        pooled[CHANNELS * 2u + local] = width_peak;
     }
     workgroupBarrier();
 
@@ -485,8 +507,8 @@ enum CompiledGpuModel {
 impl Backend for GpuBackend {
     type Executable = GpuExecutable;
 
-    fn compile(&self, model: &UnifiedModel) -> Result<Self::Executable> {
-        // Keep GPU graph acceptance exactly aligned with the fused CPU backend.
+    fn compile(&self, model: &Model) -> Result<Self::Executable> {
+        // Keep GPU model acceptance exactly aligned with the CPU backend.
         validate_roi_model(model)?;
         let input_shapes = model
             .input_info()
@@ -599,9 +621,6 @@ struct GpuContext {
     device: hal::Device,
     runner: hal::Runner,
     conv_pipeline: hal::Pipeline,
-    presence_finish_pipeline: hal::Pipeline,
-    pair_feature_pipeline: hal::Pipeline,
-    pair_tail_pipeline: hal::Pipeline,
     backend_name: &'static str,
     adapter_name: String,
 }
@@ -611,21 +630,10 @@ impl GpuContext {
         let (device, info) = hal::Device::new()?;
         let runner = device.create_runner()?;
         let conv_pipeline = create_pipeline(&device, "subfast ROI convolution", CONV_SHADER)?;
-        let presence_finish_pipeline = create_pipeline(
-            &device,
-            "subfast presence finish",
-            PRESENCE_HEAD_FINISH_SHADER,
-        )?;
-        let pair_feature_pipeline =
-            create_pipeline(&device, "subfast pair features", PAIR_FEATURE_TILED_SHADER)?;
-        let pair_tail_pipeline = create_pipeline(&device, "subfast pair tail", PAIR_TAIL_SHADER)?;
         Ok(Self {
             device,
             runner,
             conv_pipeline,
-            presence_finish_pipeline,
-            pair_feature_pipeline,
-            pair_tail_pipeline,
             backend_name: hal::backend_name(),
             adapter_name: info.name,
         })
@@ -663,7 +671,7 @@ impl GpuContext {
             );
         }
         self.runner.dispatch(
-            &self.presence_finish_pipeline,
+            &finish.pipeline,
             &finish.bind_group,
             [finish.workgroups_per_sample * batch_size as u32, 1, 1],
         );
@@ -682,7 +690,7 @@ impl GpuContext {
     ) -> Result<()> {
         self.runner.begin("subfast pair inference")?;
         self.runner.dispatch(
-            &self.pair_feature_pipeline,
+            &features.pipeline,
             &features.bind_group,
             [features.workgroups_per_sample, batch_size as u32, 1],
         );
@@ -695,7 +703,7 @@ impl GpuContext {
             );
         }
         self.runner.dispatch(
-            &self.pair_tail_pipeline,
+            &tail.pipeline,
             &tail.bind_group,
             [tail.workgroups_per_sample, batch_size as u32, 1],
         );
@@ -712,6 +720,31 @@ fn create_pipeline(
     device.create_pipeline(label, source)
 }
 
+fn presence_finish_shader(
+    input_h: usize,
+    input_w: usize,
+    region_h: usize,
+    region_w: usize,
+) -> String {
+    PRESENCE_HEAD_FINISH_SHADER
+        .replace("__INPUT_H__", &input_h.to_string())
+        .replace("__INPUT_W__", &input_w.to_string())
+        .replace("__REGION_H__", &region_h.to_string())
+        .replace("__REGION_W__", &region_w.to_string())
+}
+
+fn pair_feature_shader(input_h: usize, input_w: usize) -> String {
+    PAIR_FEATURE_TILED_SHADER
+        .replace("__INPUT_H__", &input_h.to_string())
+        .replace("__INPUT_W__", &input_w.to_string())
+}
+
+fn pair_tail_shader(input_h: usize, input_w: usize) -> String {
+    PAIR_TAIL_SHADER
+        .replace("__INPUT_H__", &input_h.to_string())
+        .replace("__INPUT_W__", &input_w.to_string())
+}
+
 struct GpuLayer {
     pipeline: Option<hal::Pipeline>,
     bind_group: hal::BindGroup,
@@ -720,6 +753,7 @@ struct GpuLayer {
 }
 
 struct GpuKernel {
+    pipeline: hal::Pipeline,
     bind_group: hal::BindGroup,
     workgroups_per_sample: u32,
     _resources: Vec<hal::Buffer>,
@@ -743,6 +777,7 @@ struct ConvParams {
 }
 
 #[derive(Clone, Copy)]
+#[allow(dead_code)]
 struct SeparableParams {
     input_h: usize,
     input_w: usize,
@@ -753,6 +788,7 @@ struct SeparableParams {
     stride_h: usize,
 }
 
+#[allow(dead_code)]
 fn fused_separable_spatial_shader(params: SeparableParams) -> String {
     let output_groups = params.out_channels / 4;
     let accumulators = (0..output_groups)
@@ -867,6 +903,7 @@ fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {{
     )
 }
 
+#[allow(dead_code)]
 fn spatial_dense_conv_shader(params: ConvParams) -> String {
     let output_groups = params.out_channels / 4;
     let groups_per_invocation = output_groups;
@@ -1007,6 +1044,7 @@ fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {{
     )
 }
 
+#[allow(dead_code)]
 fn tiled_dense_conv_shader(params: ConvParams) -> String {
     let accumulators = (0..4)
         .map(|index| format!("    var sum{index} = bias[output_group];"))
@@ -1151,6 +1189,7 @@ fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {{
     )
 }
 
+#[allow(dead_code)]
 fn vector_conv_shader(params: ConvParams) -> String {
     if !params.depthwise {
         return tiled_dense_conv_shader(params);
@@ -1307,11 +1346,6 @@ impl GpuLayer {
             .checked_mul(params.output_w)
             .and_then(|value| value.checked_mul(params.out_channels))
             .ok_or_else(|| RtError::Inference("GPU layer output size overflow".into()))?;
-        if !elements.is_multiple_of(WORKGROUP_SIZE) {
-            return Err(RtError::Inference(format!(
-                "GPU layer output {elements} is not divisible by workgroup size {WORKGROUP_SIZE}"
-            )));
-        }
         let weight_buffer = context.device.create_buffer_init(
             "subfast ROI weights",
             f32_bytes(weights),
@@ -1323,76 +1357,6 @@ impl GpuLayer {
             hal::BufferUses::STORAGE_READ_ONLY,
         )?;
 
-        if params.out_channels.is_multiple_of(4) {
-            if !params.depthwise && !params.output_w.is_multiple_of(4) {
-                return Err(RtError::Inference(format!(
-                    "GPU tiled layer output width {} is not divisible by 4",
-                    params.output_w
-                )));
-            }
-            let presence_conv1 = params.input_h == 32
-                && params.input_w == 256
-                && params.in_channels == 3
-                && params.output_h == 16
-                && params.output_w == 128
-                && params.out_channels == 16;
-            let presence_conv2 = params.input_h == 16
-                && params.input_w == 128
-                && params.in_channels == 16
-                && params.output_h == 8
-                && params.output_w == 64
-                && params.out_channels == 32;
-            let pair_stem = params.input_h == 32
-                && params.input_w == 256
-                && params.in_channels == 9
-                && params.output_h == 16
-                && params.output_w == 128
-                && params.out_channels == 16;
-            let pair_downsample = params.input_h == 16
-                && params.input_w == 128
-                && params.in_channels == 16
-                && params.output_h == 8
-                && params.output_w == 64
-                && params.out_channels == 32;
-            let spatial_dense = !params.depthwise
-                && ((params.kernel == [5, 5] && (presence_conv1 || presence_conv2))
-                    || (params.kernel == [3, 3] && (pair_stem || pair_downsample)));
-            let outputs_per_invocation = if params.depthwise {
-                4
-            } else if spatial_dense {
-                params.out_channels
-            } else {
-                16
-            };
-            let vector_elements = elements / outputs_per_invocation;
-            if !vector_elements.is_multiple_of(WORKGROUP_SIZE) {
-                return Err(RtError::Inference(format!(
-                    "GPU vector layer output {vector_elements} is not divisible by workgroup size {WORKGROUP_SIZE}"
-                )));
-            }
-            let shader_source = if spatial_dense {
-                spatial_dense_conv_shader(params)
-            } else {
-                vector_conv_shader(params)
-            };
-            let pipeline = create_pipeline(
-                &context.device,
-                "subfast vector ROI convolution",
-                &shader_source,
-            )?;
-            let bind_group = sequential_bind_group(
-                &context.device,
-                &pipeline,
-                "subfast vector ROI convolution bindings",
-                &[source, &weight_buffer, &bias_buffer, target],
-            )?;
-            return Ok(Self {
-                pipeline: Some(pipeline),
-                bind_group,
-                workgroups_per_sample: (vector_elements / WORKGROUP_SIZE) as u32,
-                _resources: vec![weight_buffer, bias_buffer],
-            });
-        }
         let values = [
             params.input_h as u32,
             params.input_w as u32,
@@ -1431,12 +1395,12 @@ impl GpuLayer {
         Ok(Self {
             pipeline: None,
             bind_group,
-            workgroups_per_sample: (elements / WORKGROUP_SIZE) as u32,
+            workgroups_per_sample: elements.div_ceil(WORKGROUP_SIZE) as u32,
             _resources: vec![weight_buffer, bias_buffer, params_buffer],
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code, clippy::too_many_arguments)]
     fn new_fused_separable(
         context: &GpuContext,
         source: &hal::Buffer,
@@ -1519,28 +1483,37 @@ struct PresenceGpu {
 }
 
 impl PresenceGpu {
-    const STAGE_ELEMENTS: usize = 16 * 128 * 16;
-
-    fn compile(model: &UnifiedModel, context: &GpuContext, max_batch: usize) -> Result<Self> {
+    fn compile(model: &Model, context: &GpuContext, max_batch: usize) -> Result<Self> {
+        let shape = &model.input_info()[0].shape;
+        let (input_h, input_w) = (shape[2], shape[3]);
+        if input_h % 4 != 0 || input_w % 4 != 0 {
+            return Err(invalid_gpu_model(
+                "presence input height and width must be divisible by 4",
+            ));
+        }
+        let (stage1_h, stage1_w) = (input_h / 2, input_w / 2);
+        let (stage2_h, stage2_w) = (input_h / 4, input_w / 4);
+        let input_elements = 3 * input_h * input_w;
+        let stage_elements = (stage1_h * stage1_w * 16).max(stage2_h * stage2_w * 32);
         let input = storage_buffer(
             &context.device,
             "subfast presence input",
             max_batch,
-            INPUT_ELEMENTS,
+            input_elements,
             hal::BufferUses::MAP_WRITE,
         )?;
         let stage_a = storage_buffer(
             &context.device,
             "subfast presence stage A",
             max_batch,
-            Self::STAGE_ELEMENTS,
+            stage_elements,
             hal::BufferUses::empty(),
         )?;
         let stage_b = storage_buffer(
             &context.device,
             "subfast presence stage B",
             max_batch,
-            Self::STAGE_ELEMENTS,
+            stage_elements,
             hal::BufferUses::empty(),
         )?;
         let output = storage_buffer(
@@ -1562,11 +1535,11 @@ impl PresenceGpu {
                 &conv1_weights,
                 &conv1_bias,
                 ConvParams::dense(
-                    32,
-                    256,
+                    input_h,
+                    input_w,
                     3,
-                    16,
-                    128,
+                    stage1_h,
+                    stage1_w,
                     16,
                     [5, 5],
                     [2, 2],
@@ -1582,7 +1555,19 @@ impl PresenceGpu {
                 &stage_b,
                 &conv2_weights,
                 &conv2_bias,
-                ConvParams::dense(16, 128, 16, 8, 64, 32, [5, 5], [2, 2], [2, 2], [1, 1], true),
+                ConvParams::dense(
+                    stage1_h,
+                    stage1_w,
+                    16,
+                    stage2_h,
+                    stage2_w,
+                    32,
+                    [5, 5],
+                    [2, 2],
+                    [2, 2],
+                    [1, 1],
+                    true,
+                ),
             )?,
         ];
         let log_scale = scalar_parameter(model, "presence_head.evidence_pool.log_scale")?;
@@ -1601,9 +1586,14 @@ impl PresenceGpu {
             ]),
             hal::BufferUses::UNIFORM,
         )?;
+        let finish_pipeline = create_pipeline(
+            &context.device,
+            "subfast presence finish",
+            &presence_finish_shader(input_h, input_w, stage2_h, stage2_w),
+        )?;
         let finish_bind_group = sequential_bind_group(
             &context.device,
-            &context.presence_finish_pipeline,
+            &finish_pipeline,
             "subfast presence head and finish bindings",
             &[
                 &input,
@@ -1620,6 +1610,7 @@ impl PresenceGpu {
             output,
             layers,
             finish: GpuKernel {
+                pipeline: finish_pipeline,
                 bind_group: finish_bind_group,
                 workgroups_per_sample: 1,
                 _resources: vec![head_weight_buffer, finish_params],
@@ -1675,6 +1666,31 @@ impl ConvParams {
         self.source_nchw = true;
         self
     }
+
+    const fn depthwise(
+        input_h: usize,
+        input_w: usize,
+        channels: usize,
+        output_h: usize,
+        output_w: usize,
+        stride: [usize; 2],
+    ) -> Self {
+        Self {
+            input_h,
+            input_w,
+            in_channels: channels,
+            output_h,
+            output_w,
+            out_channels: channels,
+            kernel: [3, 3],
+            stride,
+            padding: [1, 1],
+            dilation: [1, 1],
+            depthwise: true,
+            source_nchw: false,
+            activation: true,
+        }
+    }
 }
 
 struct PairGpu {
@@ -1690,43 +1706,49 @@ struct PairGpu {
 }
 
 impl PairGpu {
-    const FEATURE_ELEMENTS: usize = INPUT_H * INPUT_W * 9;
-    const STAGE_ELEMENTS: usize = 16 * 128 * 16;
-
-    fn compile(model: &UnifiedModel, context: &GpuContext, max_batch: usize) -> Result<Self> {
+    fn compile(model: &Model, context: &GpuContext, max_batch: usize) -> Result<Self> {
+        let shape = &model.input_info()[0].shape;
+        let (input_h, input_w) = (shape[2], shape[3]);
+        let (stem_h, stem_w) = (input_h.div_ceil(2), input_w.div_ceil(2));
+        let (down_h, down_w) = (stem_h.div_ceil(2), stem_w.div_ceil(2));
+        let (final_h, final_w) = (down_h.div_ceil(2), down_w);
+        let input_elements = input_h * input_w * 3;
+        let stage_elements = (stem_h * stem_w * 16)
+            .max(down_h * down_w * 32)
+            .max(final_h * final_w * 48);
         let left_input = storage_buffer(
             &context.device,
             "subfast pair left input",
             max_batch,
-            INPUT_ELEMENTS,
+            input_elements,
             hal::BufferUses::MAP_WRITE,
         )?;
         let right_input = storage_buffer(
             &context.device,
             "subfast pair right input",
             max_batch,
-            INPUT_ELEMENTS,
+            input_elements,
             hal::BufferUses::MAP_WRITE,
         )?;
         let features_buffer = storage_buffer(
             &context.device,
             "subfast pair features",
             max_batch,
-            Self::FEATURE_ELEMENTS,
+            input_elements,
             hal::BufferUses::empty(),
         )?;
         let stage_a = storage_buffer(
             &context.device,
             "subfast pair stage A",
             max_batch,
-            Self::STAGE_ELEMENTS,
+            stage_elements,
             hal::BufferUses::empty(),
         )?;
         let stage_b = storage_buffer(
             &context.device,
             "subfast pair stage B",
             max_batch,
-            Self::STAGE_ELEMENTS,
+            stage_elements,
             hal::BufferUses::empty(),
         )?;
         let output = storage_buffer(
@@ -1737,25 +1759,30 @@ impl PairGpu {
             hal::BufferUses::MAP_READ,
         )?;
 
-        let (stem_w, stem_b) = packed_dense(model, "model.stem.0", 9, 16, [3, 3])?;
-        let (down_w, down_b) = packed_dense(model, "model.downsample.0", 16, 32, [3, 3])?;
-        let (detail_dw_w, detail_dw_b) = packed_depthwise(model, "model.detail.0", 32)?;
-        let (detail_pw_w, detail_pw_b) = packed_dense(model, "model.detail.3", 32, 32, [1, 1])?;
-        let (vertical_dw_w, vertical_dw_b) =
-            packed_depthwise(model, "model.vertical_downsample.0", 32)?;
+        let (stem_weights, stem_b) = packed_dense(model, "stem.0", 3, 16, [3, 3])?;
+        let (down_weights, down_b) = packed_dense(model, "downsample.0", 16, 32, [3, 3])?;
+        let (detail_dw_w, detail_dw_b) = packed_depthwise(model, "detail.0", 32)?;
+        let (detail_pw_w, detail_pw_b) = packed_dense(model, "detail.3", 32, 32, [1, 1])?;
+        let (vertical_dw_w, vertical_dw_b) = packed_depthwise(model, "vertical_downsample.0", 32)?;
         let (vertical_pw_w, vertical_pw_b) =
-            packed_dense(model, "model.vertical_downsample.3", 32, 48, [1, 1])?;
-        let (context_dw_w, context_dw_b) = packed_depthwise(model, "model.context.0", 48)?;
-        let (context_pw_w, context_pw_b) = packed_dense(model, "model.context.3", 48, 48, [1, 1])?;
+            packed_dense(model, "vertical_downsample.3", 32, 48, [1, 1])?;
+        let (context_dw_w, context_dw_b) = packed_depthwise(model, "context.0", 48)?;
+        let (context_pw_w, context_pw_b) = packed_dense(model, "context.3", 48, 48, [1, 1])?;
 
+        let feature_pipeline = create_pipeline(
+            &context.device,
+            "subfast pair features",
+            &pair_feature_shader(input_h, input_w),
+        )?;
         let features = GpuKernel {
+            pipeline: feature_pipeline.clone(),
             bind_group: sequential_bind_group(
                 &context.device,
-                &context.pair_feature_pipeline,
+                &feature_pipeline,
                 "subfast pair feature bindings",
                 &[&left_input, &right_input, &features_buffer],
             )?,
-            workgroups_per_sample: 64,
+            workgroups_per_sample: (input_h * input_w).div_ceil(128) as u32,
             _resources: Vec::new(),
         };
 
@@ -1764,14 +1791,14 @@ impl PairGpu {
                 context,
                 &features_buffer,
                 &stage_a,
-                &stem_w,
+                &stem_weights,
                 &stem_b,
                 ConvParams::dense(
-                    32,
-                    256,
-                    9,
-                    16,
-                    128,
+                    input_h,
+                    input_w,
+                    3,
+                    stem_h,
+                    stem_w,
                     16,
                     [3, 3],
                     [2, 2],
@@ -1784,103 +1811,151 @@ impl PairGpu {
                 context,
                 &stage_a,
                 &stage_b,
-                &down_w,
+                &down_weights,
                 &down_b,
-                ConvParams::dense(16, 128, 16, 8, 64, 32, [3, 3], [2, 2], [1, 1], [1, 1], true),
+                ConvParams::dense(
+                    stem_h,
+                    stem_w,
+                    16,
+                    down_h,
+                    down_w,
+                    32,
+                    [3, 3],
+                    [2, 2],
+                    [1, 1],
+                    [1, 1],
+                    true,
+                ),
             )?,
-            GpuLayer::new_fused_separable(
+            GpuLayer::new(
                 context,
                 &stage_b,
                 &stage_a,
                 &detail_dw_w,
                 &detail_dw_b,
-                &detail_pw_w,
-                &detail_pw_b,
-                SeparableParams {
-                    input_h: 8,
-                    input_w: 64,
-                    in_channels: 32,
-                    output_h: 8,
-                    output_w: 64,
-                    out_channels: 32,
-                    stride_h: 1,
-                },
+                ConvParams::depthwise(down_h, down_w, 32, down_h, down_w, [1, 1]),
             )?,
-            GpuLayer::new_fused_separable(
+            GpuLayer::new(
                 context,
                 &stage_a,
                 &stage_b,
+                &detail_pw_w,
+                &detail_pw_b,
+                ConvParams::dense(
+                    down_h,
+                    down_w,
+                    32,
+                    down_h,
+                    down_w,
+                    32,
+                    [1, 1],
+                    [1, 1],
+                    [0, 0],
+                    [1, 1],
+                    true,
+                ),
+            )?,
+            GpuLayer::new(
+                context,
+                &stage_b,
+                &stage_a,
                 &vertical_dw_w,
                 &vertical_dw_b,
+                ConvParams::depthwise(down_h, down_w, 32, final_h, final_w, [2, 1]),
+            )?,
+            GpuLayer::new(
+                context,
+                &stage_a,
+                &stage_b,
                 &vertical_pw_w,
                 &vertical_pw_b,
-                SeparableParams {
-                    input_h: 8,
-                    input_w: 64,
-                    in_channels: 32,
-                    output_h: 4,
-                    output_w: 64,
-                    out_channels: 48,
-                    stride_h: 2,
-                },
+                ConvParams::dense(
+                    final_h,
+                    final_w,
+                    32,
+                    final_h,
+                    final_w,
+                    48,
+                    [1, 1],
+                    [1, 1],
+                    [0, 0],
+                    [1, 1],
+                    true,
+                ),
             )?,
-            GpuLayer::new_fused_separable(
+            GpuLayer::new(
                 context,
                 &stage_b,
                 &stage_a,
                 &context_dw_w,
                 &context_dw_b,
+                ConvParams::depthwise(final_h, final_w, 48, final_h, final_w, [1, 1]),
+            )?,
+            GpuLayer::new(
+                context,
+                &stage_a,
+                &stage_b,
                 &context_pw_w,
                 &context_pw_b,
-                SeparableParams {
-                    input_h: 4,
-                    input_w: 64,
-                    in_channels: 48,
-                    output_h: 4,
-                    output_w: 64,
-                    out_channels: 48,
-                    stride_h: 1,
-                },
+                ConvParams::dense(
+                    final_h,
+                    final_w,
+                    48,
+                    final_h,
+                    final_w,
+                    48,
+                    [1, 1],
+                    [1, 1],
+                    [0, 0],
+                    [1, 1],
+                    true,
+                ),
             )?,
         ];
 
         let mask_weight = context.device.create_buffer_init(
             "subfast pair mask weight",
-            f32_bytes(&parameter(model, "model.text_mask.weight", &[1, 48, 1, 1])?),
+            f32_bytes(&parameter(model, "text_mask.weight", &[1, 48, 1, 1])?),
             hal::BufferUses::STORAGE_READ_ONLY,
         )?;
         let classifier1_weight = context.device.create_buffer_init(
             "subfast pair classifier 1 weight",
-            f32_bytes(&parameter(model, "model.classifier.0.weight", &[32, 144])?),
+            f32_bytes(&parameter(model, "classifier.0.weight", &[32, 144])?),
             hal::BufferUses::STORAGE_READ_ONLY,
         )?;
         let classifier1_bias = context.device.create_buffer_init(
             "subfast pair classifier 1 bias",
-            f32_bytes(&parameter(model, "model.classifier.0.bias", &[32])?),
+            f32_bytes(&parameter(model, "classifier.0.bias", &[32])?),
             hal::BufferUses::STORAGE_READ_ONLY,
         )?;
         let classifier2_weight = context.device.create_buffer_init(
             "subfast pair classifier 2 weight",
-            f32_bytes(&parameter(model, "model.classifier.2.weight", &[1, 32])?),
+            f32_bytes(&parameter(model, "classifier.2.weight", &[1, 32])?),
             hal::BufferUses::STORAGE_READ_ONLY,
         )?;
         let tail_params = context.device.create_buffer_init(
             "subfast pair tail parameters",
             f32_bytes(&[
-                scalar_parameter(model, "model.text_mask.bias")?,
-                scalar_parameter(model, "model.classifier.2.bias")?,
+                scalar_parameter(model, "text_mask.bias")?,
+                scalar_parameter(model, "classifier.2.bias")?,
                 0.0,
                 0.0,
             ]),
             hal::BufferUses::UNIFORM,
         )?;
+        let tail_pipeline = create_pipeline(
+            &context.device,
+            "subfast pair tail",
+            &pair_tail_shader(final_h, final_w),
+        )?;
         let tail = GpuKernel {
+            pipeline: tail_pipeline.clone(),
             bind_group: sequential_bind_group(
                 &context.device,
-                &context.pair_tail_pipeline,
+                &tail_pipeline,
                 "subfast pair tail bindings",
                 &[
-                    &stage_a,
+                    &stage_b,
                     &mask_weight,
                     &classifier1_weight,
                     &classifier1_bias,
@@ -1992,7 +2067,7 @@ fn validate_packed_inputs(
             return Err(RtError::InvalidTensor {
                 tensor: format!("input[{index}]"),
                 message: format!(
-                    "expected packed float32 shape [batch, 3, 32, 256], got {} {:?}",
+                    "expected packed float32 shape [batch, 3, H, W] matching the model, got {} {:?}",
                     input.dtype, input.shape
                 ),
             });
@@ -2017,7 +2092,7 @@ fn validate_packed_inputs(
 }
 
 fn packed_dense(
-    model: &UnifiedModel,
+    model: &Model,
     target: &str,
     in_channels: usize,
     out_channels: usize,
@@ -2051,11 +2126,7 @@ fn packed_dense(
     Ok((packed, bias))
 }
 
-fn packed_depthwise(
-    model: &UnifiedModel,
-    target: &str,
-    channels: usize,
-) -> Result<(Vec<f32>, Vec<f32>)> {
+fn packed_depthwise(model: &Model, target: &str, channels: usize) -> Result<(Vec<f32>, Vec<f32>)> {
     let source = parameter(model, &format!("{target}.weight"), &[channels, 1, 3, 3])?;
     let mut packed = vec![0.0; source.len()];
     for channel in 0..channels {
@@ -2070,7 +2141,7 @@ fn packed_depthwise(
     Ok((packed, bias))
 }
 
-fn parameter(model: &UnifiedModel, target: &str, shape: &[usize]) -> Result<Vec<f32>> {
+fn parameter(model: &Model, target: &str, shape: &[usize]) -> Result<Vec<f32>> {
     let info = model
         .tensors
         .iter()
@@ -2078,14 +2149,14 @@ fn parameter(model: &UnifiedModel, target: &str, shape: &[usize]) -> Result<Vec<
             matches!(info.kind, TensorKind::Parameter | TensorKind::Buffer)
                 && info.target.as_deref() == Some(target)
         })
-        .ok_or_else(|| invalid_gpu_graph(format!("missing parameter {target}")))?;
+        .ok_or_else(|| invalid_gpu_model(format!("missing parameter {target}")))?;
     validate_parameter(info, target, shape)?;
     let weight = info
         .weight
-        .ok_or_else(|| invalid_gpu_graph(format!("parameter {target} has no data")))?;
+        .ok_or_else(|| invalid_gpu_model(format!("parameter {target} has no data")))?;
     let bytes = model.weights.slice(weight.offset, weight.byte_length)?;
     if bytes.len() % std::mem::size_of::<f32>() != 0 {
-        return Err(invalid_gpu_graph(format!(
+        return Err(invalid_gpu_model(format!(
             "parameter {target} byte length is not float32-aligned"
         )));
     }
@@ -2095,7 +2166,7 @@ fn parameter(model: &UnifiedModel, target: &str, shape: &[usize]) -> Result<Vec<
         .collect())
 }
 
-fn scalar_parameter(model: &UnifiedModel, target: &str) -> Result<f32> {
+fn scalar_parameter(model: &Model, target: &str) -> Result<f32> {
     let info = model
         .tensors
         .iter()
@@ -2103,7 +2174,7 @@ fn scalar_parameter(model: &UnifiedModel, target: &str) -> Result<f32> {
             matches!(info.kind, TensorKind::Parameter | TensorKind::Buffer)
                 && info.target.as_deref() == Some(target)
         })
-        .ok_or_else(|| invalid_gpu_graph(format!("missing parameter {target}")))?;
+        .ok_or_else(|| invalid_gpu_model(format!("missing parameter {target}")))?;
     if !info.shape.is_empty() && info.shape != [1] {
         return Err(RtError::InvalidTensor {
             tensor: target.into(),
@@ -2113,7 +2184,7 @@ fn scalar_parameter(model: &UnifiedModel, target: &str) -> Result<f32> {
     parameter(model, target, &info.shape)?
         .first()
         .copied()
-        .ok_or_else(|| invalid_gpu_graph(format!("scalar parameter {target} is empty")))
+        .ok_or_else(|| invalid_gpu_model(format!("scalar parameter {target} is empty")))
 }
 
 fn validate_parameter(info: &TensorInfo, target: &str, shape: &[usize]) -> Result<()> {
@@ -2129,8 +2200,8 @@ fn validate_parameter(info: &TensorInfo, target: &str, shape: &[usize]) -> Resul
     Ok(())
 }
 
-fn invalid_gpu_graph(message: impl Into<String>) -> RtError {
-    RtError::InvalidGraph(format!("GPU ROI backend: {}", message.into()))
+fn invalid_gpu_model(message: impl Into<String>) -> RtError {
+    RtError::InvalidModel(format!("GPU ROI backend: {}", message.into()))
 }
 
 fn storage_buffer(

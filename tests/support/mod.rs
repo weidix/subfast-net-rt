@@ -1,29 +1,59 @@
-use subfast_net_rt::ir::graph::{Graph, Node, NodeId};
-use subfast_net_rt::ir::op::Op;
 use subfast_net_rt::ir::tensor::{DType, Layout, TensorId, TensorInfo, TensorKind, WeightRef};
-use subfast_net_rt::model::UnifiedModel;
 use subfast_net_rt::model::weights::WeightStore;
+use subfast_net_rt::model::{Model, ModelType};
 use subfast_net_rt::tensor::Tensor;
 
 const INPUT_SHAPE: [usize; 4] = [1, 3, 32, 256];
+const PAIR_INPUT_SHAPE: [usize; 4] = [1, 3, 64, 256];
 
 pub fn deterministic_input(seed: u32) -> Tensor {
-    Tensor::from_f32(INPUT_SHAPE.to_vec(), deterministic_values(seed)).unwrap()
+    deterministic_input_for(INPUT_SHAPE, seed)
+}
+
+pub fn deterministic_input_with_shape(shape: &[usize], seed: u32) -> Tensor {
+    Tensor::from_f32(shape.to_vec(), deterministic_values(shape, seed)).unwrap()
+}
+
+pub fn deterministic_pair_input(seed: u32) -> Tensor {
+    deterministic_input_for(PAIR_INPUT_SHAPE, seed)
 }
 
 pub fn packed_input(seeds: &[u32]) -> Tensor {
-    let mut shape = INPUT_SHAPE.to_vec();
-    shape[0] = seeds.len();
-    let values = seeds
-        .iter()
-        .flat_map(|seed| deterministic_values(*seed))
-        .collect();
-    Tensor::from_f32(shape, values).unwrap()
+    packed_input_for(INPUT_SHAPE, seeds)
 }
 
-fn deterministic_values(seed: u32) -> Vec<f32> {
+#[allow(dead_code)]
+pub fn packed_input_with_shape(shape: &[usize], seeds: &[u32]) -> Tensor {
+    let mut packed_shape = shape.to_vec();
+    packed_shape[0] = seeds.len();
+    let values = seeds
+        .iter()
+        .flat_map(|seed| deterministic_values(shape, *seed))
+        .collect();
+    Tensor::from_f32(packed_shape, values).unwrap()
+}
+
+pub fn packed_pair_input(seeds: &[u32]) -> Tensor {
+    packed_input_for(PAIR_INPUT_SHAPE, seeds)
+}
+
+fn deterministic_input_for(shape: [usize; 4], seed: u32) -> Tensor {
+    Tensor::from_f32(shape.to_vec(), deterministic_values(&shape, seed)).unwrap()
+}
+
+fn packed_input_for(shape: [usize; 4], seeds: &[u32]) -> Tensor {
+    let mut packed_shape = shape.to_vec();
+    packed_shape[0] = seeds.len();
+    let values = seeds
+        .iter()
+        .flat_map(|seed| deterministic_values(&shape, *seed))
+        .collect();
+    Tensor::from_f32(packed_shape, values).unwrap()
+}
+
+fn deterministic_values(shape: &[usize], seed: u32) -> Vec<f32> {
     let mut state = seed;
-    (0..INPUT_SHAPE[1..].iter().product())
+    (0..shape[1..].iter().product())
         .map(|_| {
             state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
             (state >> 8) as f32 * (2.0 / 16_777_216.0) - 1.0
@@ -31,9 +61,13 @@ fn deterministic_values(seed: u32) -> Vec<f32> {
         .collect()
 }
 
-pub fn synthetic_presence_model() -> UnifiedModel {
+pub fn synthetic_presence_model() -> Model {
+    synthetic_presence_model_with_shape(INPUT_SHAPE)
+}
+
+pub fn synthetic_presence_model_with_shape(shape: [usize; 4]) -> Model {
     let mut builder = ModelBuilder::new();
-    let input = builder.add_tensor("x", TensorKind::UserInput, INPUT_SHAPE.to_vec());
+    let input = builder.add_tensor("x", TensorKind::UserInput, shape.to_vec());
 
     builder.add_conv_parameters("backbone.0", [16, 3, 5, 5]);
     builder.add_conv_parameters("backbone.2", [32, 16, 5, 5]);
@@ -42,197 +76,32 @@ pub fn synthetic_presence_model() -> UnifiedModel {
     builder.add_parameter_values("presence_head.evidence_pool.bias", vec![], &[0.025]);
 
     let output = builder.add_tensor("output", TensorKind::UserOutput, vec![1]);
-    let specs = vec![
-        conv("backbone.0", [2, 2], [2, 2], [1, 1], 1),
-        op("aten.silu_.default", Op::Silu),
-        conv("backbone.2", [2, 2], [2, 2], [1, 1], 1),
-        op("aten.silu_.default", Op::Silu),
-        conv("presence_head.local", [1, 1], [2, 2], [2, 2], 1),
-        op("aten.abs.default", Op::Abs),
-        op("aten.amax.default", Op::ReduceMax { axes: vec![1] }),
-        op("aten.gt.Scalar", Op::GreaterThan { value: 1e-8 }),
-        op(
-            "aten.to.dtype",
-            Op::Cast {
-                dtype: DType::Float32,
-            },
-        ),
-        avg_pool([4, 4], [4, 4], [0, 0], true),
-        op("aten.gt.Scalar", Op::GreaterThan { value: 0.5 }),
-        op(
-            "aten.to.dtype",
-            Op::Cast {
-                dtype: DType::Float32,
-            },
-        ),
-        op("aten.gt.Scalar", Op::GreaterThan { value: 0.5 }),
-        op(
-            "aten.to.dtype",
-            Op::Cast {
-                dtype: DType::Float32,
-            },
-        ),
-        avg_pool([5, 5], [1, 1], [2, 2], false),
-        op("aten.mul.Tensor", Op::Mul { value: None }),
-        avg_pool([5, 5], [1, 1], [2, 2], false),
-        op("aten.clamp_min.default", Op::ClampMin { value: 1e-6 }),
-        op("aten.div.Tensor", Op::Div),
-        op("aten.gt.Scalar", Op::GreaterThan { value: 0.5 }),
-        op("aten.bitwise_not.default", Op::BitwiseNot),
-        op(
-            "aten.masked_fill.Scalar",
-            Op::MaskedFill { value: f32::MIN },
-        ),
-        op(
-            "aten.amax.default",
-            Op::ReduceMax {
-                axes: vec![1, 2, 3],
-            },
-        ),
-        op("aten.clamp_min.default", Op::ClampMin { value: -10_000.0 }),
-        op("aten.softplus.default", Op::Softplus),
-        op(
-            "aten.add.Tensor",
-            Op::Add {
-                alpha: 1.0,
-                value: Some(0.5),
-            },
-        ),
-        op("aten.mul.Tensor", Op::Mul { value: None }),
-        op(
-            "aten.add.Tensor",
-            Op::Add {
-                alpha: 1.0,
-                value: None,
-            },
-        ),
-    ];
-    builder.finish(vec![input], output, specs)
+    builder.finish(vec![input], output)
 }
 
-pub fn synthetic_pair_model() -> UnifiedModel {
-    let mut builder = ModelBuilder::new();
-    let left = builder.add_tensor("left", TensorKind::UserInput, INPUT_SHAPE.to_vec());
-    let right = builder.add_tensor("right", TensorKind::UserInput, INPUT_SHAPE.to_vec());
+pub fn synthetic_pair_model() -> Model {
+    synthetic_pair_model_with_shape(PAIR_INPUT_SHAPE)
+}
 
-    builder.add_conv_parameters("model.stem.0", [16, 9, 3, 3]);
-    builder.add_conv_parameters("model.downsample.0", [32, 16, 3, 3]);
-    builder.add_conv_parameters("model.detail.0", [32, 1, 3, 3]);
-    builder.add_conv_parameters("model.detail.3", [32, 32, 1, 1]);
-    builder.add_conv_parameters("model.vertical_downsample.0", [32, 1, 3, 3]);
-    builder.add_conv_parameters("model.vertical_downsample.3", [48, 32, 1, 1]);
-    builder.add_conv_parameters("model.context.0", [48, 1, 3, 3]);
-    builder.add_conv_parameters("model.context.3", [48, 48, 1, 1]);
-    builder.add_conv_parameters("model.text_mask", [1, 48, 1, 1]);
-    builder.add_linear_parameters("model.classifier.0", [32, 144]);
-    builder.add_linear_parameters("model.classifier.2", [1, 32]);
+pub fn synthetic_pair_model_with_shape(shape: [usize; 4]) -> Model {
+    let mut builder = ModelBuilder::new();
+    let left = builder.add_tensor("left", TensorKind::UserInput, shape.to_vec());
+    let right = builder.add_tensor("right", TensorKind::UserInput, shape.to_vec());
+
+    builder.add_conv_parameters("stem.0", [16, 3, 3, 3]);
+    builder.add_conv_parameters("downsample.0", [32, 16, 3, 3]);
+    builder.add_conv_parameters("detail.0", [32, 1, 3, 3]);
+    builder.add_conv_parameters("detail.3", [32, 32, 1, 1]);
+    builder.add_conv_parameters("vertical_downsample.0", [32, 1, 3, 3]);
+    builder.add_conv_parameters("vertical_downsample.3", [48, 32, 1, 1]);
+    builder.add_conv_parameters("context.0", [48, 1, 3, 3]);
+    builder.add_conv_parameters("context.3", [48, 48, 1, 1]);
+    builder.add_conv_parameters("text_mask", [1, 48, 1, 1]);
+    builder.add_linear_parameters("classifier.0", [32, 144]);
+    builder.add_linear_parameters("classifier.2", [1, 32]);
 
     let output = builder.add_tensor("output", TensorKind::UserOutput, vec![1]);
-    let specs = vec![
-        op("aten.sub.Tensor", Op::Sub),
-        avg_pool([5, 5], [1, 1], [2, 2], false),
-        op(
-            "aten.add.Tensor",
-            Op::Add {
-                alpha: 1.0,
-                value: None,
-            },
-        ),
-        op("aten.mul.Tensor", Op::Mul { value: Some(0.5) }),
-        op("aten.abs.default", Op::Abs),
-        op("aten.sub.Tensor", Op::Sub),
-        op("aten.abs.default", Op::Abs),
-        op("aten.cat.default", Op::Cat { dim: 1 }),
-        conv("model.stem.0", [2, 2], [1, 1], [1, 1], 1),
-        op("aten.silu_.default", Op::Silu),
-        conv("model.downsample.0", [2, 2], [1, 1], [1, 1], 1),
-        op("aten.silu_.default", Op::Silu),
-        conv("model.detail.0", [1, 1], [1, 1], [1, 1], 32),
-        op("aten.silu_.default", Op::Silu),
-        conv("model.detail.3", [1, 1], [0, 0], [1, 1], 1),
-        op("aten.silu_.default", Op::Silu),
-        conv("model.vertical_downsample.0", [2, 1], [1, 1], [1, 1], 32),
-        op("aten.silu_.default", Op::Silu),
-        conv("model.vertical_downsample.3", [1, 1], [0, 0], [1, 1], 1),
-        op("aten.silu_.default", Op::Silu),
-        conv("model.context.0", [1, 1], [1, 1], [1, 1], 48),
-        op("aten.silu_.default", Op::Silu),
-        conv("model.context.3", [1, 1], [0, 0], [1, 1], 1),
-        op("aten.silu_.default", Op::Silu),
-        conv("model.text_mask", [1, 1], [0, 0], [1, 1], 1),
-        op("aten.sigmoid.default", Op::Sigmoid),
-        op("aten.mul.Tensor", Op::Mul { value: Some(0.75) }),
-        op(
-            "aten.add.Tensor",
-            Op::Add {
-                alpha: 1.0,
-                value: Some(0.25),
-            },
-        ),
-        op("aten.mul.Tensor", Op::Mul { value: None }),
-        op("aten.mean.dim", Op::ReduceMean { axes: vec![2, 3] }),
-        op("aten.amax.default", Op::ReduceMax { axes: vec![2, 3] }),
-        op("aten.mean.dim", Op::ReduceMean { axes: vec![2] }),
-        op("aten.amax.default", Op::ReduceMax { axes: vec![-1] }),
-        op("aten.cat.default", Op::Cat { dim: 1 }),
-        op("aten.linear.default", Op::Linear),
-        op("aten.silu_.default", Op::Silu),
-        op("aten.linear.default", Op::Linear),
-        op("aten.squeeze.dim", Op::Squeeze { dim: 1 }),
-    ];
-    builder.finish(vec![left, right], output, specs)
-}
-
-enum NodeSpec {
-    Op {
-        original_op: &'static str,
-        op: Op,
-    },
-    Conv {
-        target: &'static str,
-        stride: [usize; 2],
-        padding: [usize; 2],
-        dilation: [usize; 2],
-        groups: usize,
-    },
-}
-
-fn op(original_op: &'static str, op: Op) -> NodeSpec {
-    NodeSpec::Op { original_op, op }
-}
-
-fn conv(
-    target: &'static str,
-    stride: [usize; 2],
-    padding: [usize; 2],
-    dilation: [usize; 2],
-    groups: usize,
-) -> NodeSpec {
-    NodeSpec::Conv {
-        target,
-        stride,
-        padding,
-        dilation,
-        groups,
-    }
-}
-
-fn avg_pool(
-    kernel: [usize; 2],
-    stride: [usize; 2],
-    padding: [usize; 2],
-    count_include_pad: bool,
-) -> NodeSpec {
-    op(
-        "aten.avg_pool2d.default",
-        Op::AvgPool2d {
-            kernel,
-            stride,
-            padding,
-            ceil_mode: false,
-            count_include_pad,
-        },
-    )
+    builder.finish(vec![left, right], output)
 }
 
 struct ModelBuilder {
@@ -315,77 +184,13 @@ impl ModelBuilder {
         });
     }
 
-    fn parameter_id(&self, target: &str) -> TensorId {
-        self.tensors
-            .iter()
-            .find(|tensor| tensor.target.as_deref() == Some(target))
-            .map(|tensor| tensor.id)
-            .unwrap_or_else(|| panic!("missing synthetic parameter {target}"))
-    }
-
-    fn finish(
-        mut self,
-        inputs: Vec<TensorId>,
-        output: TensorId,
-        specs: Vec<NodeSpec>,
-    ) -> UnifiedModel {
-        let mut nodes = Vec::with_capacity(specs.len());
-        let mut previous = inputs[0];
-        let last_index = specs.len() - 1;
-        for (index, spec) in specs.into_iter().enumerate() {
-            let node_output = if index == last_index {
-                output
+    fn finish(self, inputs: Vec<TensorId>, output: TensorId) -> Model {
+        Model {
+            model_type: if inputs.len() == 1 {
+                ModelType::RoiPresence
             } else {
-                self.add_tensor(
-                    format!("synthetic_intermediate_{index}"),
-                    TensorKind::Intermediate,
-                    vec![1],
-                )
-            };
-            let (name, original_op, op, node_inputs) = match spec {
-                NodeSpec::Op { original_op, op } => (
-                    format!("synthetic_node_{index}"),
-                    original_op,
-                    op,
-                    vec![previous],
-                ),
-                NodeSpec::Conv {
-                    target,
-                    stride,
-                    padding,
-                    dilation,
-                    groups,
-                } => {
-                    let weight = self.parameter_id(&format!("{target}.weight"));
-                    let bias = self.parameter_id(&format!("{target}.bias"));
-                    (
-                        target.replace('.', "_"),
-                        "aten.conv2d.default",
-                        Op::Conv2d {
-                            stride,
-                            padding,
-                            dilation,
-                            groups,
-                        },
-                        vec![previous, weight, bias],
-                    )
-                }
-            };
-            nodes.push(Node {
-                id: NodeId(index),
-                name,
-                original_op: original_op.into(),
-                op,
-                inputs: node_inputs,
-                outputs: vec![node_output],
-            });
-            previous = node_output;
-        }
-
-        UnifiedModel {
-            format: "subfast-net.unified-model".into(),
-            format_version: 1,
-            graph: Graph { nodes },
+                ModelType::RoiPairMatcher
+            },
             tensors: self.tensors,
             inputs,
             outputs: vec![output],

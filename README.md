@@ -1,208 +1,93 @@
 # subfast-net-rt
 
-Small Rust runtime for the custom subfast-net.unified-model export format.
+Pure Rust inference runtime for the `subfast-net.safetensors` ROI models exported
+by the sibling Python project.
 
-Current phase:
+The loader accepts one model directory containing exactly:
 
-- Model loading, schema validation, typed IR normalization, and weight bounds checks are implemented.
-- Presence and Pair Matcher have a dependency-free, pure Rust CPU execution path.
-- AArch64 uses NEON kernels and persistent workers; x86_64 selects AVX2+FMA at runtime and retains a scalar fallback.
-- CPU weights are packed into shared `Arc` storage once. Scalar and per-worker activation arenas are reused without hot-path allocation.
-- Packed CPU batches use persistent whole-sample workers only when they improve throughput; small batches retain the scalar SIMD path.
-- The optional pure-Rust GPU feature selects Metal on macOS and Vulkan on every other native target.
+- `config.json`
+- `model.safetensors`
 
-Supported ATen operators:
+It validates the safetensors bundle and model contract, folds Pair Matcher
+Conv+BatchNorm weights for inference, and rejects unsupported formats or model
+types. There is no legacy model-format fallback.
 
-- aten.conv2d.default
-- aten.batch_norm.default
-- aten.silu.default
-- aten.silu_.default
-- aten.add.Tensor
-- aten.upsample_bilinear2d.vec
-- aten.abs.default
-- aten.amax.default
-- aten.mean.dim
-- aten.gt.Scalar
-- aten.to.dtype
-- aten.avg_pool2d.default
-- aten.mul.Tensor
-- aten.sub.Tensor
-- aten.div.Tensor
-- aten.bitwise_not.default
-- aten.masked_fill.Scalar
-- aten.clamp_min.default
-- aten.softplus.default
-- aten.cat.default
-- aten.sigmoid.default
-- aten.linear.default
-- aten.squeeze.dim
+Supported models:
 
-## ROI models
+- ROI Presence: one `[batch, 3, H, W]` NCHW input
+- ROI Pair Matcher: two identically shaped `[batch, 3, H, W]` NCHW inputs
 
-`roi-infer` supports the two scalar-output models exported by the sibling
-Python project. It selects presence or pair-matcher inference from the model's
-input count and applies the preprocessing used during training. The CLI uses
-the CPU backend by default; pass `--backend gpu` with the `gpu` feature enabled
-to use Metal on macOS or Vulkan on other native platforms.
+`H` and `W` are read from `config.json` and drive preprocessing, CPU/GPU
+activation storage, GPU buffers, dispatch geometry, and WGSL specialization.
+Presence dimensions must be divisible by four to match its exported mask path.
+
+Both models have optimized CPU execution. AArch64 uses NEON kernels and
+persistent workers; x86_64 selects AVX2+FMA at runtime. The optional GPU feature
+uses Metal on macOS and Vulkan on other native targets through `wgpu-hal`.
+
+## Image inference
 
 ~~~bash
-# Unified presence probability for one ROI. The model path is the directory
-# containing model.json and weights.bin.
 cargo run --release --bin roi-infer -- \
-  --model-path <path-to-presence-model> \
+  --model-path <path-to-safetensors-directory> \
   --image <roi-image>
 
-# Unified match probability for two ROIs.
 cargo run --release --bin roi-infer -- \
-  --model-path <path-to-pair-matcher-model> \
+  --model-path <path-to-pair-safetensors-directory> \
   --image <left-roi> \
   --right-image <right-roi>
 
-# GPU inference (Metal on macOS, Vulkan on other native platforms).
 cargo run --release --features gpu --bin roi-infer -- \
   --backend gpu \
-  --model-path <path-to-presence-model> \
+  --model-path <path-to-safetensors-directory> \
   --image <roi-image>
 ~~~
 
-## Pure Rust CPU batch inference
+The CLI reads preprocessing dimensions from the loaded model contract. Presence
+uses centered letterboxing; Pair Matcher uses stretched resizing.
 
-Each input to `run_batch_scalar` is one packed float32 tensor shaped
-`[batch, 3, 32, 256]`. Presence receives one tensor and Pair Matcher receives
-two tensors. Outputs preserve sample order.
+## Library use
 
 ~~~rust
 use subfast_net_rt::backend::Backend;
 use subfast_net_rt::backend::cpu::CpuBackend;
+use subfast_net_rt::Model;
 
+let model = Model::load("outputs/roi_presence_v3/safetensors")?;
 let mut executable = CpuBackend.compile(&model)?;
 let logits = executable.run_batch_scalar(&packed_inputs)?;
 ~~~
 
-Use `run_batch_scalar_into` with a preallocated output slice to remove the last
-per-call allocation.
+`run_batch_scalar_into` accepts a preallocated output slice. One executable owns
+mutable scratch storage, so concurrent request workers should each own an
+executable.
 
-## CPU benchmark
-
-Benchmark scalar and packed-batch throughput on identical pre-generated inputs:
+## Benchmarks
 
 ~~~bash
 cargo run --release --bin cpu-bench -- \
-  --model-path <path-to-model> \
+  --model-path <path-to-safetensors-directory> \
   --warmup 2000 \
   --iterations 10000 \
   --batch-sizes 1,2,4,8,16,32
-~~~
 
-The benchmark verifies every batch against scalar results, alternates the two
-paths across measurement rounds, and reports samples/second plus speedup. Model
-loading, input generation, and preprocessing are excluded.
-
-On a 10-core Apple M4, the current scheduler measured 1.86x/2.03x Presence
-throughput at batch 16/32 and 2.68x/3.22x/3.33x Pair Matcher throughput at batch
-8/16/32. Small batches stay on the scalar path and remain at scalar throughput.
-
-## GPU inference
-
-Enable the optional GPU backend:
-
-~~~bash
-cargo build --release --features gpu
-~~~
-
-~~~rust
-use subfast_net_rt::backend::Backend;
-use subfast_net_rt::backend::gpu::GpuBackend;
-
-let backend = GpuBackend::with_max_batch_size(8)?;
-let mut executable = backend.compile(&model)?;
-let logits = executable.run_batch_scalar(&packed_inputs)?;
-let selected_backend = executable.backend_name(); // "metal" or "vulkan"
-~~~
-
-The backend uses `wgpu-hal` directly and compiles WGSL kernels through Naga for
-feature construction, convolution, depthwise convolution, masking, pooling,
-and linear classification. It uploads FP32 weights to private GPU buffers once
-and reuses pipelines, bind groups, activation buffers, and command/fence
-objects. Input and scalar-output buffers stay persistently mapped. macOS
-requests only Metal; every other native target requests only Vulkan. Apart from
-input upload, command submission, and the final scalar readback, every model
-operator executes on the GPU.
-
-Benchmark the synchronous CPU and GPU batch paths with identical inputs:
-
-~~~bash
 cargo run --release --features gpu --bin gpu-bench -- \
-  --model-path <path-to-model> \
+  --model-path <path-to-safetensors-directory> \
   --warmup 5000 \
   --iterations 50000 \
   --batch-sizes 32 \
   --rounds 10
 ~~~
 
-On a 10-core/10-GPU-core Apple M4, repeated direct HAL FP32 runs measured about
-2.1x Presence and Pair Matcher throughput over the CPU batch backend at batch
-32. Replacing `wgpu` with `wgpu-hal` therefore did not reach the 4x target for
-these models.
+Model loading and preprocessing are excluded from inference benchmark timings.
 
-Build the CPU runtime with:
+## Build and test
 
 ~~~bash
 cargo build --release
+cargo build --release --features gpu
+cargo test
 ~~~
 
-For low-latency preprocessing, keep decoded frames as tightly packed RGB8 and
-reuse both `ImagePreprocessor` and its output tensor:
-
-~~~rust
-use subfast_net_rt::image_infer::{ImagePreprocessor, ResizeMode};
-
-let mut preprocessor =
-    ImagePreprocessor::new(&[1, 3, 32, 256], ResizeMode::LetterboxCentered)?;
-let mut input = preprocessor.new_output_tensor();
-preprocessor.preprocess_rgb_into(rgb, width, height, &mut input)?;
-~~~
-
-This path uses pure Rust SIMD resizing and performs no steady-state allocation.
-JPEG/PNG decoding is separate and is not expected to fit within a 0.1 ms
-preprocessing budget. Benchmark decoded RGB input on each target device with:
-
-~~~bash
-cargo run --release --bin preprocess-bench -- \
-  --source-width 1920 --source-height 1080 --mode centered
-~~~
-
-The JSON manifest names weights.bin. The loader validates the supplied binary
-content against all JSON offsets and lengths instead of relying on the filename.
-
-Current limits:
-
-- The pure Rust CPU compiler currently recognizes the fixed Presence and Pair Matcher export graphs with `[1, 3, 32, 256]` inputs.
-- Packed batches use `[batch, 3, 32, 256]`; GPU batches cannot exceed the maximum selected at compile time.
-- One executable owns mutable scratch storage; use one executable per concurrent request worker.
-- Inference-mode BatchNorm only.
-- FP32 float tensors for execution; int64 buffers are accepted for unused BatchNorm counters.
-- Finite operator set.
-- No training.
-- Unknown dynamic shape is unsupported.
-- Tests cover packed-batch parity, repeatability, Pair symmetry, backend
-  selection, and GPU-to-CPU parity; configured real fixtures are also exercised
-  when available.
-
-Reference-output format reserved for future validation:
-
-- test_input.bin
-- expected_output.bin
-- test_case.json
-
-Default comparison tolerances:
-
-- FP32: atol=1e-5, rtol=1e-4
-- FP16: atol=1e-3, rtol=1e-2
-
-Adding a new operator requires:
-
-1. Parse and validate its ATen node attributes in src/model/loader.rs.
-2. Add a typed variant to src/ir/op.rs.
-3. Add a CPU fusion/pattern implementation.
-4. Add loader and backend tests.
+Set `SUBFAST_RT_PRESENCE_DIR` and `SUBFAST_RT_PAIR_DIR` to safetensors model
+directories to run the real-model loader and inference tests.

@@ -1,14 +1,16 @@
 use std::hint::black_box;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 use subfast_net_rt::image_infer::{ImagePreprocessor, ResizeMode};
-
-const INPUT_SHAPE: [usize; 4] = [1, 3, 32, 256];
+use subfast_net_rt::model::Model;
 
 #[derive(Debug, Parser)]
 #[command(about = "Benchmark allocation-free RGB8 image preprocessing")]
 struct Args {
+    #[arg(long, value_name = "MODEL_DIR")]
+    model_path: PathBuf,
     #[arg(long, default_value_t = 1920)]
     source_width: u32,
     #[arg(long, default_value_t = 1080)]
@@ -53,8 +55,10 @@ fn run() -> subfast_net_rt::Result<()> {
         ));
     }
 
+    let model = Model::load(&args.model_path)?;
+    let input_shape = &model.input_info()[0].shape;
+    let mut preprocessor = ImagePreprocessor::new(input_shape, args.mode.into())?;
     let rgb = deterministic_rgb(args.source_width, args.source_height);
-    let mut preprocessor = ImagePreprocessor::new(&INPUT_SHAPE, args.mode.into())?;
     let mut output = preprocessor.new_output_tensor();
     for _ in 0..args.warmup {
         black_box(preprocessor.preprocess_rgb_into(
@@ -85,7 +89,7 @@ fn run() -> subfast_net_rt::Result<()> {
 
     println!("pipeline: decoded-rgb8 -> SIMD-bilinear -> normalized-f32-nchw");
     println!("source: {}x{}", args.source_width, args.source_height);
-    println!("target: 256x32");
+    println!("target: {}x{}", input_shape[3], input_shape[2]);
     println!("mode: {:?}", args.mode);
     println!("iterations: {}", args.iterations);
     println!("average_us: {average_us:.3}");

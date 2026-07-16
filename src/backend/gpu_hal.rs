@@ -325,7 +325,7 @@ impl Device {
         };
         let shader_descriptor = hal::ShaderModuleDescriptor {
             label: Some(label),
-            // SAFETY: dispatch sizes and buffer extents are validated by the fixed graph compiler.
+            // SAFETY: dispatch sizes and buffer extents are validated by the fixed model compiler.
             runtime_checks: wgt::ShaderRuntimeChecks::unchecked(),
         };
         let naga_shader = hal::NagaShader {

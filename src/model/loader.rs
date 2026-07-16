@@ -1,36 +1,113 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 
-use serde_json::Value;
+use safetensors::{Dtype as SafeDtype, SafeTensors};
 
 use crate::error::{Result, RtError};
-use crate::ir::graph::{Graph, Node, NodeId};
-use crate::ir::op::Op;
 use crate::ir::tensor::{DType, Layout, TensorId, TensorInfo, TensorKind, WeightRef};
-use crate::model::schema::{RawModel, RawNode, RawTensor};
-use crate::model::validate::validate_topology;
+use crate::model::schema::ModelConfig;
 use crate::model::weights::WeightStore;
 
+const FORMAT: &str = "subfast-net.safetensors";
+const FORMAT_VERSION: u64 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModelType {
+    RoiPresence,
+    RoiPairMatcher,
+}
+
+impl ModelType {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "roi_presence" => Ok(Self::RoiPresence),
+            "roi_pair_matcher" => Ok(Self::RoiPairMatcher),
+            other => Err(RtError::Inference(format!(
+                "unsupported safetensors model type {other}"
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
-pub struct UnifiedModel {
-    pub format: String,
-    pub format_version: u64,
-    pub graph: Graph,
+pub struct Model {
+    pub model_type: ModelType,
     pub tensors: Vec<TensorInfo>,
     pub inputs: Vec<TensorId>,
     pub outputs: Vec<TensorId>,
     pub weights: WeightStore,
 }
 
-impl UnifiedModel {
-    pub fn load(model_json: impl AsRef<Path>, model_path: impl AsRef<Path>) -> Result<Self> {
-        let model_json = model_json.as_ref();
-        let model_path = model_path.as_ref();
-        let json_bytes = std::fs::read(model_json).map_err(|e| RtError::io(model_json, e))?;
-        let raw: RawModel = serde_json::from_slice(&json_bytes)
-            .map_err(|e| RtError::Json(format!("{}: {}", model_json.display(), e)))?;
-        let weights = WeightStore::load(model_path)?;
-        Self::from_raw(raw, weights)
+impl Model {
+    pub fn load(model_dir: impl AsRef<Path>) -> Result<Self> {
+        let model_dir = model_dir.as_ref();
+        let config_path = model_dir.join("config.json");
+        let config_bytes = std::fs::read(&config_path).map_err(|e| RtError::io(&config_path, e))?;
+        let config: ModelConfig = serde_json::from_slice(&config_bytes)
+            .map_err(|e| RtError::Json(format!("{}: {e}", config_path.display())))?;
+        validate_config(&config)?;
+
+        let model_type = ModelType::parse(&config.model_type)?;
+        let weights_path = model_dir.join(&config.weights.file);
+        let bytes = std::fs::read(&weights_path).map_err(|e| RtError::io(&weights_path, e))?;
+        let (_, metadata) = SafeTensors::read_metadata(&bytes)
+            .map_err(|e| RtError::Safetensors(format!("{}: {e}", weights_path.display())))?;
+        let metadata = metadata.metadata().as_ref().ok_or_else(|| {
+            RtError::Safetensors("model.safetensors is missing required metadata".into())
+        })?;
+        for (key, expected) in [
+            ("format", FORMAT),
+            ("format_version", "1"),
+            ("model_type", config.model_type.as_str()),
+        ] {
+            if metadata.get(key).map(String::as_str) != Some(expected) {
+                return Err(RtError::Safetensors(format!(
+                    "metadata {key} does not match config.json"
+                )));
+            }
+        }
+        let file = SafeTensors::deserialize(&bytes)
+            .map_err(|e| RtError::Safetensors(format!("{}: {e}", weights_path.display())))?;
+        let raw = collect_tensors(&file)?;
+
+        let mut builder = ModelBuilder::default();
+        let inputs = match model_type {
+            ModelType::RoiPresence => validate_io(&config, &["images"], "presence_logit")?
+                .into_iter()
+                .map(|(name, shape)| builder.add_io(&name, TensorKind::UserInput, shape.to_vec()))
+                .collect(),
+            ModelType::RoiPairMatcher => {
+                let inputs = validate_io(&config, &["left", "right"], "same_subtitle_logit")?;
+                if inputs[0].1 != inputs[1].1 {
+                    return Err(RtError::Json(
+                        "pair matcher inputs must have identical shapes".into(),
+                    ));
+                }
+                inputs
+                    .into_iter()
+                    .map(|(name, shape)| {
+                        builder.add_io(&name, TensorKind::UserInput, shape.to_vec())
+                    })
+                    .collect()
+            }
+        };
+        let output_name = match model_type {
+            ModelType::RoiPresence => "presence_logit",
+            ModelType::RoiPairMatcher => "same_subtitle_logit",
+        };
+        let output = builder.add_io(output_name, TensorKind::UserOutput, vec![1]);
+
+        match model_type {
+            ModelType::RoiPresence => load_presence_weights(&raw, &mut builder)?,
+            ModelType::RoiPairMatcher => load_pair_weights(&raw, &mut builder)?,
+        }
+        Ok(Self {
+            model_type,
+            tensors: builder.tensors,
+            inputs,
+            outputs: vec![output],
+            weights: WeightStore::from_bytes(builder.weights),
+        })
     }
 
     pub fn input_info(&self) -> Vec<&TensorInfo> {
@@ -40,603 +117,287 @@ impl UnifiedModel {
     pub fn output_info(&self) -> Vec<&TensorInfo> {
         self.outputs.iter().map(|id| &self.tensors[id.0]).collect()
     }
-
-    fn from_raw(raw: RawModel, weights: WeightStore) -> Result<Self> {
-        if raw.format != "subfast-net.unified-model" || raw.format_version != 1 {
-            return Err(RtError::FormatVersion {
-                format: raw.format,
-                version: raw.format_version,
-            });
-        }
-        if raw.weights.byte_order != "little" || raw.weights.layout != "dense_row_major" {
-            return Err(RtError::Json(format!(
-                "unsupported weights metadata: byte_order={}, layout={}",
-                raw.weights.byte_order, raw.weights.layout
-            )));
-        }
-        if raw.graph.node_count != raw.nodes.len() {
-            return Err(RtError::InvalidGraph(format!(
-                "graph.node_count {} does not match nodes length {}",
-                raw.graph.node_count,
-                raw.nodes.len()
-            )));
-        }
-
-        let output_names: HashSet<String> = raw.outputs.iter().map(|t| t.name.clone()).collect();
-        let mut name_to_id = HashMap::new();
-        let mut tensors = Vec::with_capacity(raw.tensors.len());
-        for (idx, (name, tensor)) in raw.tensors.iter().enumerate() {
-            if name != &tensor.name {
-                return Err(RtError::InvalidTensor {
-                    tensor: name.clone(),
-                    message: format!("map key does not match tensor name {}", tensor.name),
-                });
-            }
-            let info = parse_tensor(TensorId(idx), tensor, output_names.contains(name), &weights)?;
-            name_to_id.insert(name.clone(), info.id);
-            tensors.push(info);
-        }
-
-        let inputs = raw
-            .inputs
-            .iter()
-            .map(|input| {
-                lookup_declared_tensor(input, &name_to_id, &tensors, TensorKind::UserInput)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let outputs = raw
-            .outputs
-            .iter()
-            .map(|output| {
-                lookup_declared_tensor(output, &name_to_id, &tensors, TensorKind::UserOutput)
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let graph = Graph {
-            nodes: raw
-                .nodes
-                .iter()
-                .enumerate()
-                .map(|(idx, node)| parse_node(idx, node, &name_to_id, &tensors))
-                .collect::<Result<Vec<_>>>()?,
-        };
-        validate_topology(&graph, &tensors, &inputs)?;
-
-        Ok(Self {
-            format: raw.format,
-            format_version: raw.format_version,
-            graph,
-            tensors,
-            inputs,
-            outputs,
-            weights,
-        })
-    }
 }
 
-fn lookup_declared_tensor(
-    raw: &crate::model::schema::RawTensorRef,
-    name_to_id: &HashMap<String, TensorId>,
-    tensors: &[TensorInfo],
-    expected_kind: TensorKind,
-) -> Result<TensorId> {
-    let id = *name_to_id
-        .get(&raw.name)
-        .ok_or_else(|| RtError::InvalidGraph(format!("declared tensor {} is missing", raw.name)))?;
-    let tensor = &tensors[id.0];
-    if tensor.dtype.to_string() != raw.dtype
-        || tensor.shape != raw.shape
-        || tensor.layout.to_string() != raw.layout
-    {
-        return Err(RtError::InvalidTensor {
-            tensor: raw.name.clone(),
-            message: "declaration does not match tensor table".into(),
+fn validate_config(config: &ModelConfig) -> Result<()> {
+    if config.format != FORMAT || config.format_version != FORMAT_VERSION {
+        return Err(RtError::FormatVersion {
+            format: config.format.clone(),
+            version: config.format_version,
         });
     }
-    match expected_kind {
-        TensorKind::UserInput if tensor.kind != TensorKind::UserInput => {
-            return Err(RtError::InvalidTensor {
-                tensor: raw.name.clone(),
-                message: "input declaration does not refer to user_input tensor".into(),
-            });
-        }
-        TensorKind::UserOutput if tensor.kind != TensorKind::UserOutput => {
-            return Err(RtError::InvalidTensor {
-                tensor: raw.name.clone(),
-                message: "output declaration does not refer to graph output tensor".into(),
-            });
-        }
-        _ => {}
+    if config.weights.format != "safetensors" || config.weights.file != "model.safetensors" {
+        return Err(RtError::Json(
+            "weights must reference model.safetensors in safetensors format".into(),
+        ));
     }
-    Ok(id)
+    if config.model.model_type != config.model_type {
+        return Err(RtError::Json(
+            "model.type does not match top-level model_type".into(),
+        ));
+    }
+    match config.model_type.as_str() {
+        "roi_presence" if config.model.architecture_version == 3 => {}
+        "roi_pair_matcher"
+            if config.model.architecture_version == 2
+                && config.model.pooling_version == Some(2) => {}
+        _ => {
+            return Err(RtError::Json(format!(
+                "unsupported {} architecture/pooling version",
+                config.model_type
+            )));
+        }
+    }
+    Ok(())
 }
 
-fn parse_tensor(
-    id: TensorId,
-    raw: &RawTensor,
-    is_user_output: bool,
-    weights: &WeightStore,
-) -> Result<TensorInfo> {
-    let dtype = DType::parse(&raw.dtype).ok_or_else(|| RtError::UnsupportedDTypeLayout {
-        tensor: raw.name.clone(),
-        dtype: raw.dtype.clone(),
-        layout: raw.layout.clone(),
-    })?;
-    let layout = Layout::parse(&raw.layout).ok_or_else(|| RtError::UnsupportedDTypeLayout {
-        tensor: raw.name.clone(),
-        dtype: raw.dtype.clone(),
-        layout: raw.layout.clone(),
-    })?;
-    let mut kind = match raw.kind.as_str() {
-        "user_input" => TensorKind::UserInput,
-        "parameter" => TensorKind::Parameter,
-        "buffer" => TensorKind::Buffer,
-        "intermediate" => TensorKind::Intermediate,
-        other => {
-            return Err(RtError::InvalidTensor {
-                tensor: raw.name.clone(),
-                message: format!("unknown tensor kind {}", other),
-            });
-        }
-    };
-    if is_user_output {
-        kind = TensorKind::UserOutput;
-    }
-
-    let expected_len =
-        dtype
-            .byte_len_for_shape(&raw.shape)
-            .ok_or_else(|| RtError::InvalidTensor {
-                tensor: raw.name.clone(),
-                message: "shape byte length overflow".into(),
-            })?;
-    let weight = if let Some(data) = &raw.data {
-        if data.file != "weights.bin" {
-            return Err(RtError::InvalidTensor {
-                tensor: raw.name.clone(),
-                message: format!("unsupported tensor data file {}", data.file),
-            });
-        }
-        let offset = usize::try_from(data.offset).map_err(|_| RtError::InvalidTensor {
-            tensor: raw.name.clone(),
-            message: "offset does not fit usize".into(),
-        })?;
-        let byte_length =
-            usize::try_from(data.byte_length).map_err(|_| RtError::InvalidTensor {
-                tensor: raw.name.clone(),
-                message: "byte_length does not fit usize".into(),
-            })?;
-        if byte_length != expected_len {
-            return Err(RtError::InvalidTensor {
-                tensor: raw.name.clone(),
-                message: format!(
-                    "declared byte length {} does not match dtype/shape length {}",
-                    byte_length, expected_len
-                ),
-            });
-        }
-        let end = offset
-            .checked_add(byte_length)
-            .ok_or_else(|| RtError::WeightsOutOfBounds {
-                tensor: raw.name.clone(),
-                offset: data.offset,
-                length: data.byte_length,
-                file_len: weights.total_bytes() as u64,
-            })?;
-        if end > weights.total_bytes() {
-            return Err(RtError::WeightsOutOfBounds {
-                tensor: raw.name.clone(),
-                offset: data.offset,
-                length: data.byte_length,
-                file_len: weights.total_bytes() as u64,
-            });
-        }
-        Some(WeightRef {
-            offset,
-            byte_length,
-        })
-    } else {
-        if matches!(kind, TensorKind::Parameter | TensorKind::Buffer) {
-            return Err(RtError::InvalidTensor {
-                tensor: raw.name.clone(),
-                message: "parameter/buffer tensor is missing data".into(),
-            });
-        }
-        None
-    };
-
-    Ok(TensorInfo {
-        id,
-        name: raw.name.clone(),
-        dtype,
-        shape: raw.shape.clone(),
-        layout,
-        kind,
-        target: raw.target.clone(),
-        weight,
-    })
-}
-
-fn parse_node(
-    idx: usize,
-    raw: &RawNode,
-    name_to_id: &HashMap<String, TensorId>,
-    tensors: &[TensorInfo],
-) -> Result<Node> {
-    let inputs = raw
-        .inputs
+fn validate_io(
+    config: &ModelConfig,
+    expected_inputs: &[&str],
+    expected_output: &str,
+) -> Result<Vec<(String, [usize; 4])>> {
+    let required = config
+        .input
+        .tensors
         .iter()
-        .map(|name| {
-            name_to_id.get(name).copied().ok_or_else(|| {
-                RtError::InvalidGraph(format!("node {} input {} is missing", raw.name, name))
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let outputs = raw
-        .outputs
-        .iter()
-        .map(|output| {
-            name_to_id.get(&output.name).copied().ok_or_else(|| {
-                RtError::InvalidGraph(format!(
-                    "node {} output {} is missing",
-                    raw.name, output.name
-                ))
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
-    if outputs.is_empty() {
-        return Err(RtError::InvalidGraph(format!(
-            "node {} has no outputs",
-            raw.name
+        .filter(|tensor| !tensor.optional)
+        .collect::<Vec<_>>();
+    if required.len() != expected_inputs.len() {
+        return Err(RtError::Json(format!(
+            "expected {} required inputs, got {}",
+            expected_inputs.len(),
+            required.len()
         )));
     }
-    let op = normalize_op(raw, &inputs, tensors)?;
-    Ok(Node {
-        id: NodeId(idx),
-        name: raw.name.clone(),
-        original_op: raw.op.clone(),
-        op,
-        inputs,
-        outputs,
-    })
-}
-
-fn normalize_op(raw: &RawNode, inputs: &[TensorId], tensors: &[TensorInfo]) -> Result<Op> {
-    match raw.op.as_str() {
-        "aten.conv2d.default" => {
-            if !(2..=3).contains(&inputs.len()) {
-                return Err(RtError::UnsupportedOpParams {
-                    node: raw.name.clone(),
-                    message: format!("conv2d expects 2 or 3 inputs, got {}", inputs.len()),
-                });
-            }
-            Ok(Op::Conv2d {
-                stride: attr_usize_pair(&raw.attrs, "stride", [1, 1])?,
-                padding: attr_usize_pair(&raw.attrs, "padding", [0, 0])?,
-                dilation: attr_usize_pair(&raw.attrs, "dilation", [1, 1])?,
-                groups: attr_usize(&raw.attrs, "groups", 1)?,
-            })
+    let mut inputs = Vec::with_capacity(required.len());
+    for (tensor, name) in required.iter().zip(expected_inputs) {
+        let shape = tensor.shape.nchw().ok_or_else(|| {
+            RtError::Json(format!("input {name} must have shape [batch, 3, H, W]"))
+        })?;
+        if tensor.name != *name || tensor.layout != "NCHW" || shape[1] != 3 {
+            return Err(RtError::Json(format!(
+                "input {name} must be NCHW with shape [batch, 3, H, W]"
+            )));
         }
-        "aten.batch_norm.default" => {
-            if inputs.len() != 5 {
-                return Err(RtError::UnsupportedOpParams {
-                    node: raw.name.clone(),
-                    message: format!("batch_norm expects 5 inputs, got {}", inputs.len()),
-                });
-            }
-            let training = attr_bool(&raw.attrs, "training", false)?;
-            if training {
-                return Err(RtError::UnsupportedOpParams {
-                    node: raw.name.clone(),
-                    message: "training=true batch_norm is not supported".into(),
-                });
-            }
-            Ok(Op::BatchNorm {
-                epsilon: attr_f32(&raw.attrs, "eps", 1e-5)?,
-                training,
-            })
+        if shape[2] == 0 || shape[3] == 0 {
+            return Err(RtError::Json(format!(
+                "input {name} dimensions must be non-zero"
+            )));
         }
-        "aten.silu.default" | "aten.silu_.default" => {
-            if inputs.len() != 1 {
-                return Err(RtError::UnsupportedOpParams {
-                    node: raw.name.clone(),
-                    message: format!("silu expects 1 input, got {}", inputs.len()),
-                });
-            }
-            Ok(Op::Silu)
-        }
-        "aten.add.Tensor" => {
-            if !(1..=2).contains(&inputs.len()) {
-                return Err(RtError::UnsupportedOpParams {
-                    node: raw.name.clone(),
-                    message: format!("add.Tensor expects 1 or 2 inputs, got {}", inputs.len()),
-                });
-            }
-            Ok(Op::Add {
-                alpha: attr_f32(&raw.attrs, "alpha", 1.0)?,
-                value: (inputs.len() == 1)
-                    .then(|| attr_f32_required(&raw.attrs, "arg1"))
-                    .transpose()?,
-            })
-        }
-        "aten.upsample_bilinear2d.vec" => {
-            if inputs.len() != 1 {
-                return Err(RtError::UnsupportedOpParams {
-                    node: raw.name.clone(),
-                    message: format!("upsample_bilinear2d expects 1 input, got {}", inputs.len()),
-                });
-            }
-            Ok(Op::UpsampleBilinear2d {
-                output_size: attr_usize_pair_required(&raw.attrs, "output_size")?,
-                align_corners: attr_bool(&raw.attrs, "align_corners", false)?,
-                scale_factors: attr_optional_f32_pair(&raw.attrs, "scale_factors")?,
-            })
-        }
-        "aten.abs.default" => unary(raw, inputs, Op::Abs),
-        "aten.amax.default" => unary(
-            raw,
-            inputs,
-            Op::ReduceMax {
-                axes: attr_isize_list(&raw.attrs, "arg1")?,
-            },
-        ),
-        "aten.mean.dim" => unary(
-            raw,
-            inputs,
-            Op::ReduceMean {
-                axes: attr_isize_list(&raw.attrs, "arg1")?,
-            },
-        ),
-        "aten.gt.Scalar" => unary(
-            raw,
-            inputs,
-            Op::GreaterThan {
-                value: attr_f32_required(&raw.attrs, "arg1")?,
-            },
-        ),
-        "aten.to.dtype" => unary(
-            raw,
-            inputs,
-            Op::Cast {
-                dtype: attr_dtype(&raw.attrs, "arg1")?,
-            },
-        ),
-        "aten.avg_pool2d.default" => unary(
-            raw,
-            inputs,
-            Op::AvgPool2d {
-                kernel: attr_usize_pair_required(&raw.attrs, "arg1")?,
-                stride: attr_usize_pair(&raw.attrs, "arg2", [1, 1])?,
-                padding: attr_usize_pair(&raw.attrs, "arg3", [0, 0])?,
-                ceil_mode: attr_bool(&raw.attrs, "arg4", false)?,
-                count_include_pad: attr_bool(&raw.attrs, "arg5", true)?,
-            },
-        ),
-        "aten.mul.Tensor" => elementwise_optional_scalar(raw, inputs, |value| Op::Mul { value }),
-        "aten.sub.Tensor" => binary(raw, inputs, Op::Sub),
-        "aten.div.Tensor" => binary(raw, inputs, Op::Div),
-        "aten.bitwise_not.default" => unary(raw, inputs, Op::BitwiseNot),
-        "aten.masked_fill.Scalar" => binary(
-            raw,
-            inputs,
-            Op::MaskedFill {
-                value: attr_f32_required(&raw.attrs, "arg2")?,
-            },
-        ),
-        "aten.clamp_min.default" => unary(
-            raw,
-            inputs,
-            Op::ClampMin {
-                value: attr_f32_required(&raw.attrs, "arg1")?,
-            },
-        ),
-        "aten.softplus.default" => unary(raw, inputs, Op::Softplus),
-        "aten.cat.default" => Ok(Op::Cat {
-            dim: attr_isize(&raw.attrs, "arg1")?,
-        }),
-        "aten.sigmoid.default" => unary(raw, inputs, Op::Sigmoid),
-        "aten.linear.default" => {
-            if !(2..=3).contains(&inputs.len()) {
-                return Err(RtError::UnsupportedOpParams {
-                    node: raw.name.clone(),
-                    message: format!("linear expects 2 or 3 inputs, got {}", inputs.len()),
-                });
-            }
-            Ok(Op::Linear)
-        }
-        "aten.squeeze.dim" => unary(
-            raw,
-            inputs,
-            Op::Squeeze {
-                dim: attr_isize(&raw.attrs, "arg1")?,
-            },
-        ),
-        other => Err(RtError::UnsupportedOp {
-            node: raw.name.clone(),
-            op: other.into(),
-            inputs: format_input_info(inputs, tensors),
-        }),
+        inputs.push((tensor.name.clone(), shape));
     }
-}
-
-fn unary(raw: &RawNode, inputs: &[TensorId], op: Op) -> Result<Op> {
-    if inputs.len() != 1 {
-        return Err(RtError::UnsupportedOpParams {
-            node: raw.name.clone(),
-            message: format!("{} expects 1 input, got {}", raw.op, inputs.len()),
-        });
+    if config
+        .output
+        .tensors
+        .first()
+        .is_none_or(|tensor| tensor.name != expected_output || !tensor.shape.is_batch_scalar())
+    {
+        return Err(RtError::Json(format!(
+            "expected scalar output {expected_output}"
+        )));
     }
-    Ok(op)
+    Ok(inputs)
 }
 
-fn binary(raw: &RawNode, inputs: &[TensorId], op: Op) -> Result<Op> {
-    if inputs.len() != 2 {
-        return Err(RtError::UnsupportedOpParams {
-            node: raw.name.clone(),
-            message: format!("{} expects 2 inputs, got {}", raw.op, inputs.len()),
-        });
-    }
-    Ok(op)
+struct RawTensor<'a> {
+    dtype: SafeDtype,
+    shape: Vec<usize>,
+    data: &'a [u8],
 }
 
-fn elementwise_optional_scalar(
-    raw: &RawNode,
-    inputs: &[TensorId],
-    build: impl FnOnce(Option<f32>) -> Op,
-) -> Result<Op> {
-    if !(1..=2).contains(&inputs.len()) {
-        return Err(RtError::UnsupportedOpParams {
-            node: raw.name.clone(),
-            message: format!("{} expects 1 or 2 inputs, got {}", raw.op, inputs.len()),
-        });
-    }
-    let value = (inputs.len() == 1)
-        .then(|| attr_f32_required(&raw.attrs, "arg1"))
-        .transpose()?;
-    Ok(build(value))
-}
-
-fn format_input_info(inputs: &[TensorId], tensors: &[TensorInfo]) -> String {
-    inputs
+fn collect_tensors<'a>(file: &'a SafeTensors<'a>) -> Result<HashMap<String, RawTensor<'a>>> {
+    Ok(file
         .iter()
-        .map(|id| {
-            let t = &tensors[id.0];
-            format!(
-                "{} dtype={} shape={:?} layout={}",
-                t.name, t.dtype, t.shape, t.layout
+        .map(|(name, view)| {
+            (
+                name.to_owned(),
+                RawTensor {
+                    dtype: view.dtype(),
+                    shape: view.shape().to_vec(),
+                    data: view.data(),
+                },
             )
         })
-        .collect::<Vec<_>>()
-        .join("; ")
+        .collect())
 }
 
-fn attr_usize(attrs: &BTreeMap<String, Value>, key: &str, default: usize) -> Result<usize> {
-    match attrs.get(key) {
-        None | Some(Value::Null) => Ok(default),
-        Some(Value::Number(n)) => n.as_u64().map(|v| v as usize).ok_or_else(|| {
-            RtError::Json(format!("attribute {} must be a non-negative integer", key))
-        }),
-        _ => Err(RtError::Json(format!(
-            "attribute {} must be an integer",
-            key
-        ))),
+fn load_presence_weights(
+    raw: &HashMap<String, RawTensor<'_>>,
+    builder: &mut ModelBuilder,
+) -> Result<()> {
+    for (name, shape) in [
+        ("backbone.0.weight", vec![16, 3, 5, 5]),
+        ("backbone.0.bias", vec![16]),
+        ("backbone.2.weight", vec![32, 16, 5, 5]),
+        ("backbone.2.bias", vec![32]),
+        ("presence_head.local.weight", vec![1, 32, 3, 3]),
+        ("presence_head.local.bias", vec![1]),
+        ("presence_head.evidence_pool.log_scale", vec![]),
+        ("presence_head.evidence_pool.bias", vec![]),
+    ] {
+        builder.add_raw_f32(raw, name, &shape)?;
     }
+    Ok(())
 }
 
-fn attr_usize_pair(
-    attrs: &BTreeMap<String, Value>,
-    key: &str,
-    default: [usize; 2],
-) -> Result<[usize; 2]> {
-    match attrs.get(key) {
-        None | Some(Value::Null) => Ok(default),
-        Some(_) => attr_usize_pair_required(attrs, key),
+fn load_pair_weights(
+    raw: &HashMap<String, RawTensor<'_>>,
+    builder: &mut ModelBuilder,
+) -> Result<()> {
+    for (conv, bn, shape) in [
+        ("stem.0", "stem.1", vec![16, 3, 3, 3]),
+        ("downsample.0", "downsample.1", vec![32, 16, 3, 3]),
+        ("detail.0", "detail.1", vec![32, 1, 3, 3]),
+        ("detail.3", "detail.4", vec![32, 32, 1, 1]),
+        (
+            "vertical_downsample.0",
+            "vertical_downsample.1",
+            vec![32, 1, 3, 3],
+        ),
+        (
+            "vertical_downsample.3",
+            "vertical_downsample.4",
+            vec![48, 32, 1, 1],
+        ),
+        ("context.0", "context.1", vec![48, 1, 3, 3]),
+        ("context.3", "context.4", vec![48, 48, 1, 1]),
+    ] {
+        builder.add_folded_conv_bn(raw, conv, bn, &shape)?;
     }
+    for (name, shape) in [
+        ("text_mask.weight", vec![1, 48, 1, 1]),
+        ("text_mask.bias", vec![1]),
+        ("classifier.0.weight", vec![32, 144]),
+        ("classifier.0.bias", vec![32]),
+        ("classifier.2.weight", vec![1, 32]),
+        ("classifier.2.bias", vec![1]),
+    ] {
+        builder.add_raw_f32(raw, name, &shape)?;
+    }
+    Ok(())
 }
 
-fn attr_usize_pair_required(attrs: &BTreeMap<String, Value>, key: &str) -> Result<[usize; 2]> {
-    match attrs.get(key) {
-        Some(Value::Array(values)) if values.len() == 2 => {
-            let a = values[0].as_u64().ok_or_else(|| {
-                RtError::Json(format!(
-                    "attribute {}[0] must be a non-negative integer",
-                    key
-                ))
-            })?;
-            let b = values[1].as_u64().ok_or_else(|| {
-                RtError::Json(format!(
-                    "attribute {}[1] must be a non-negative integer",
-                    key
-                ))
-            })?;
-            Ok([a as usize, b as usize])
+#[derive(Default)]
+struct ModelBuilder {
+    tensors: Vec<TensorInfo>,
+    weights: Vec<u8>,
+}
+
+impl ModelBuilder {
+    fn add_io(&mut self, name: &str, kind: TensorKind, shape: Vec<usize>) -> TensorId {
+        let id = TensorId(self.tensors.len());
+        self.tensors.push(TensorInfo {
+            id,
+            name: name.into(),
+            dtype: DType::Float32,
+            shape,
+            layout: Layout::DenseRowMajor,
+            kind,
+            target: None,
+            weight: None,
+        });
+        id
+    }
+
+    fn add_raw_f32(
+        &mut self,
+        raw: &HashMap<String, RawTensor<'_>>,
+        name: &str,
+        shape: &[usize],
+    ) -> Result<()> {
+        let tensor = require_f32(raw, name, shape)?;
+        self.add_parameter(name, shape.to_vec(), tensor.data);
+        Ok(())
+    }
+
+    fn add_folded_conv_bn(
+        &mut self,
+        raw: &HashMap<String, RawTensor<'_>>,
+        conv: &str,
+        bn: &str,
+        shape: &[usize],
+    ) -> Result<()> {
+        let weight = f32_values(require_f32(raw, &format!("{conv}.weight"), shape)?.data);
+        let channels = shape[0];
+        let gamma = f32_values(require_f32(raw, &format!("{bn}.weight"), &[channels])?.data);
+        let beta = f32_values(require_f32(raw, &format!("{bn}.bias"), &[channels])?.data);
+        let mean = f32_values(require_f32(raw, &format!("{bn}.running_mean"), &[channels])?.data);
+        let variance =
+            f32_values(require_f32(raw, &format!("{bn}.running_var"), &[channels])?.data);
+        let per_channel = weight.len() / channels;
+        let mut fused_weight = weight;
+        let mut fused_bias = vec![0.0; channels];
+        for channel in 0..channels {
+            let scale = gamma[channel] / (variance[channel] + 1e-5).sqrt();
+            for value in &mut fused_weight[channel * per_channel..(channel + 1) * per_channel] {
+                *value *= scale;
+            }
+            fused_bias[channel] = beta[channel] - mean[channel] * scale;
         }
-        _ => Err(RtError::Json(format!(
-            "attribute {} must be a length-2 integer array",
-            key
-        ))),
+        self.add_parameter(
+            &format!("{conv}.weight"),
+            shape.to_vec(),
+            &f32_bytes(&fused_weight),
+        );
+        self.add_parameter(
+            &format!("{conv}.bias"),
+            vec![channels],
+            &f32_bytes(&fused_bias),
+        );
+        Ok(())
+    }
+
+    fn add_parameter(&mut self, name: &str, shape: Vec<usize>, data: &[u8]) {
+        let offset = self.weights.len();
+        self.weights.extend_from_slice(data);
+        let id = TensorId(self.tensors.len());
+        self.tensors.push(TensorInfo {
+            id,
+            name: name.into(),
+            dtype: DType::Float32,
+            shape,
+            layout: Layout::DenseRowMajor,
+            kind: TensorKind::Parameter,
+            target: Some(name.into()),
+            weight: Some(WeightRef {
+                offset,
+                byte_length: data.len(),
+            }),
+        });
     }
 }
 
-fn attr_f32(attrs: &BTreeMap<String, Value>, key: &str, default: f32) -> Result<f32> {
-    match attrs.get(key) {
-        None | Some(Value::Null) => Ok(default),
-        Some(Value::Number(n)) => n
-            .as_f64()
-            .map(|v| v as f32)
-            .ok_or_else(|| RtError::Json(format!("attribute {} must be a float", key))),
-        _ => Err(RtError::Json(format!("attribute {} must be a float", key))),
+fn require_f32<'a>(
+    raw: &'a HashMap<String, RawTensor<'a>>,
+    name: &str,
+    shape: &[usize],
+) -> Result<&'a RawTensor<'a>> {
+    let tensor = raw.get(name).ok_or_else(|| RtError::InvalidTensor {
+        tensor: name.into(),
+        message: "missing from model.safetensors".into(),
+    })?;
+    if tensor.dtype != SafeDtype::F32 || tensor.shape != shape {
+        return Err(RtError::InvalidTensor {
+            tensor: name.into(),
+            message: format!(
+                "expected F32 shape {shape:?}, got {} {:?}",
+                tensor.dtype, tensor.shape
+            ),
+        });
     }
+    Ok(tensor)
 }
 
-fn attr_f32_required(attrs: &BTreeMap<String, Value>, key: &str) -> Result<f32> {
-    match attrs.get(key) {
-        Some(Value::Number(number)) => number
-            .as_f64()
-            .map(|value| value as f32)
-            .ok_or_else(|| RtError::Json(format!("attribute {key} must be a float"))),
-        _ => Err(RtError::Json(format!("attribute {key} must be a float"))),
-    }
+fn f32_values(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|value| f32::from_le_bytes(value.try_into().unwrap()))
+        .collect()
 }
 
-fn attr_isize(attrs: &BTreeMap<String, Value>, key: &str) -> Result<isize> {
-    attrs
-        .get(key)
-        .and_then(Value::as_i64)
-        .map(|value| value as isize)
-        .ok_or_else(|| RtError::Json(format!("attribute {key} must be an integer")))
-}
-
-fn attr_isize_list(attrs: &BTreeMap<String, Value>, key: &str) -> Result<Vec<isize>> {
-    match attrs.get(key) {
-        Some(Value::Array(values)) => values
-            .iter()
-            .map(|value| {
-                value.as_i64().map(|value| value as isize).ok_or_else(|| {
-                    RtError::Json(format!("attribute {key} must be an integer array"))
-                })
-            })
-            .collect(),
-        _ => Err(RtError::Json(format!(
-            "attribute {key} must be an integer array"
-        ))),
-    }
-}
-
-fn attr_dtype(attrs: &BTreeMap<String, Value>, key: &str) -> Result<DType> {
-    let value = attrs
-        .get(key)
-        .and_then(Value::as_str)
-        .ok_or_else(|| RtError::Json(format!("attribute {key} must be a dtype string")))?;
-    DType::parse(value).ok_or_else(|| RtError::Json(format!("unsupported dtype {value}")))
-}
-
-fn attr_bool(attrs: &BTreeMap<String, Value>, key: &str, default: bool) -> Result<bool> {
-    match attrs.get(key) {
-        None | Some(Value::Null) => Ok(default),
-        Some(Value::Bool(value)) => Ok(*value),
-        _ => Err(RtError::Json(format!(
-            "attribute {} must be a boolean",
-            key
-        ))),
-    }
-}
-
-fn attr_optional_f32_pair(attrs: &BTreeMap<String, Value>, key: &str) -> Result<Option<[f32; 2]>> {
-    match attrs.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Array(values)) if values.len() == 2 => {
-            let a = values[0]
-                .as_f64()
-                .ok_or_else(|| RtError::Json(format!("attribute {}[0] must be a float", key)))?;
-            let b = values[1]
-                .as_f64()
-                .ok_or_else(|| RtError::Json(format!("attribute {}[1] must be a float", key)))?;
-            Ok(Some([a as f32, b as f32]))
-        }
-        _ => Err(RtError::Json(format!(
-            "attribute {} must be null or a length-2 float array",
-            key
-        ))),
-    }
+fn f32_bytes(values: &[f32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect()
 }

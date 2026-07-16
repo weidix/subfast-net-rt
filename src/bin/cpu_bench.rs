@@ -6,7 +6,7 @@ use clap::Parser;
 use subfast_net_rt::backend::Backend;
 use subfast_net_rt::backend::cpu::{CpuBackend, CpuExecutable};
 use subfast_net_rt::ir::tensor::DType;
-use subfast_net_rt::model::UnifiedModel;
+use subfast_net_rt::model::Model;
 use subfast_net_rt::tensor::Tensor;
 
 #[derive(Debug, Parser)]
@@ -52,10 +52,7 @@ fn run() -> subfast_net_rt::Result<()> {
     let args = Args::parse();
     validate_args(&args)?;
 
-    let model = UnifiedModel::load(
-        args.model_path.join("model.json"),
-        args.model_path.join("weights.bin"),
-    )?;
+    let model = Model::load(&args.model_path)?;
     let mut executable = CpuBackend.compile(&model)?;
     let batch_one = make_batch_case(&model, 1)?;
     let (last_output, mut timings) = measure_batch_one_latency(
@@ -250,7 +247,7 @@ fn measure_packed(
     Ok(start.elapsed())
 }
 
-fn make_batch_case(model: &UnifiedModel, batch_size: usize) -> subfast_net_rt::Result<BatchCase> {
+fn make_batch_case(model: &Model, batch_size: usize) -> subfast_net_rt::Result<BatchCase> {
     let samples = (0..batch_size)
         .map(|sample_index| make_inputs(model, sample_index))
         .collect::<subfast_net_rt::Result<Vec<_>>>()?;
@@ -262,7 +259,7 @@ fn make_batch_case(model: &UnifiedModel, batch_size: usize) -> subfast_net_rt::R
     })
 }
 
-fn make_inputs(model: &UnifiedModel, sample_index: usize) -> subfast_net_rt::Result<Vec<Tensor>> {
+fn make_inputs(model: &Model, sample_index: usize) -> subfast_net_rt::Result<Vec<Tensor>> {
     model
         .input_info()
         .into_iter()
@@ -290,10 +287,7 @@ fn make_inputs(model: &UnifiedModel, sample_index: usize) -> subfast_net_rt::Res
         .collect()
 }
 
-fn pack_inputs(
-    model: &UnifiedModel,
-    samples: &[Vec<Tensor>],
-) -> subfast_net_rt::Result<Vec<Tensor>> {
+fn pack_inputs(model: &Model, samples: &[Vec<Tensor>]) -> subfast_net_rt::Result<Vec<Tensor>> {
     model
         .input_info()
         .into_iter()

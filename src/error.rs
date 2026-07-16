@@ -12,6 +12,8 @@ pub enum RtError {
     },
     #[error("JSON/schema error: {0}")]
     Json(String),
+    #[error("safetensors error: {0}")]
+    Safetensors(String),
     #[error("unsupported format version: format={format}, version={version}")]
     FormatVersion { format: String, version: u64 },
     #[error(
@@ -23,24 +25,16 @@ pub enum RtError {
         length: u64,
         file_len: u64,
     },
-    #[error("invalid graph: {0}")]
-    InvalidGraph(String),
+    #[error("invalid model: {0}")]
+    InvalidModel(String),
     #[error("invalid tensor {tensor}: {message}")]
     InvalidTensor { tensor: String, message: String },
-    #[error("unsupported op at node {node}: {op}; inputs: {inputs}")]
-    UnsupportedOp {
-        node: String,
-        op: String,
-        inputs: String,
-    },
     #[error("unsupported dtype/layout for tensor {tensor}: dtype={dtype}, layout={layout}")]
     UnsupportedDTypeLayout {
         tensor: String,
         dtype: String,
         layout: String,
     },
-    #[error("unsupported op parameter combination at node {node}: {message}")]
-    UnsupportedOpParams { node: String, message: String },
     #[error("inference execution failed: {0}")]
     Inference(String),
 }

@@ -2,20 +2,20 @@ use std::path::{Path, PathBuf};
 
 use subfast_net_rt::backend::Backend;
 use subfast_net_rt::backend::cpu::CpuBackend;
-use subfast_net_rt::model::UnifiedModel;
+use subfast_net_rt::model::Model;
 use subfast_net_rt::tensor::Tensor;
 
 fn fixture(variable: &str) -> Option<PathBuf> {
     let path = std::env::var_os(variable).map(PathBuf::from)?;
-    if path.join("model.json").is_file() && path.join("weights.bin").is_file() {
+    if path.join("config.json").is_file() && path.join("model.safetensors").is_file() {
         Some(path)
     } else {
-        panic!("{variable} does not point to a unified model directory");
+        panic!("{variable} does not point to a safetensors model directory");
     }
 }
 
-fn load(path: &Path) -> UnifiedModel {
-    UnifiedModel::load(path.join("model.json"), path.join("weights.bin")).unwrap()
+fn load(path: &Path) -> Model {
+    Model::load(path).unwrap()
 }
 
 fn deterministic_input(shape: &[usize], seed: u32) -> Tensor {
@@ -42,6 +42,7 @@ fn presence_cpu_is_finite_and_repeatable() {
     let second = executable.run_scalar(&[input]).unwrap();
     assert!(first.is_finite());
     assert_eq!(first, second);
+    assert!((first - 4.158_833_5).abs() <= 1e-4, "{first}");
 }
 
 #[test]
@@ -65,4 +66,5 @@ fn pair_cpu_is_finite_repeatable_and_symmetric() {
     assert!(forward.is_finite());
     assert_eq!(forward, repeated);
     assert!((forward - swapped).abs() <= 2e-5, "{forward} vs {swapped}");
+    assert!((forward - -31.207_836).abs() <= 2e-4, "{forward}");
 }

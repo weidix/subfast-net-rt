@@ -3,19 +3,39 @@ mod support;
 use subfast_net_rt::backend::Backend;
 use subfast_net_rt::backend::cpu::CpuBackend;
 
-use support::{deterministic_input, packed_input, synthetic_pair_model, synthetic_presence_model};
+use support::{
+    deterministic_input, deterministic_input_with_shape, deterministic_pair_input, packed_input,
+    packed_pair_input, synthetic_pair_model, synthetic_pair_model_with_shape,
+    synthetic_presence_model, synthetic_presence_model_with_shape,
+};
 
 const BATCH_SIZES: [usize; 5] = [0, 1, 3, 8, 17];
 const TOLERANCE: f32 = 2e-5;
 
 #[test]
-fn fused_backend_rejects_changed_operator_attributes() {
+fn cpu_uses_dynamic_model_input_dimensions() {
+    for (model, seed_count) in [
+        (synthetic_presence_model_with_shape([1, 3, 48, 320]), 1usize),
+        (synthetic_pair_model_with_shape([1, 3, 96, 320]), 2usize),
+    ] {
+        let shape = model.input_info()[0].shape.clone();
+        let inputs = (0..seed_count)
+            .map(|index| deterministic_input_with_shape(&shape, 0x1234_5678 ^ index as u32))
+            .collect::<Vec<_>>();
+        let mut executable = CpuBackend.compile(&model).unwrap();
+        assert!(executable.run_scalar(&inputs).unwrap().is_finite());
+        assert_eq!(executable.input_shapes()[0], shape);
+    }
+}
+
+#[test]
+fn backend_rejects_model_type_mismatch() {
     let mut presence = synthetic_presence_model();
-    presence.graph.nodes[10].op = subfast_net_rt::ir::op::Op::GreaterThan { value: 0.25 };
+    presence.model_type = subfast_net_rt::model::ModelType::RoiPairMatcher;
     assert!(CpuBackend.compile(&presence).is_err());
 
     let mut pair = synthetic_pair_model();
-    pair.graph.nodes[29].op = subfast_net_rt::ir::op::Op::ReduceMean { axes: vec![3] };
+    pair.model_type = subfast_net_rt::model::ModelType::RoiPresence;
     assert!(CpuBackend.compile(&pair).is_err());
 }
 
@@ -75,8 +95,8 @@ fn synthetic_presence_compiles_and_is_finite_and_repeatable() {
 #[test]
 fn synthetic_pair_compiles_and_is_finite_repeatable_and_symmetric() {
     let model = synthetic_pair_model();
-    let left = deterministic_input(0x1357_9bdf);
-    let right = deterministic_input(0x2468_ace0);
+    let left = deterministic_pair_input(0x1357_9bdf);
+    let right = deterministic_pair_input(0x2468_ace0);
     let mut executable = CpuBackend.compile(&model).unwrap();
 
     let forward = executable
@@ -98,13 +118,13 @@ fn synthetic_pair_compiles_and_is_finite_repeatable_and_symmetric() {
             .iter()
             .zip(&right_seeds)
             .map(|(left_seed, right_seed)| {
-                let left = deterministic_input(*left_seed);
-                let right = deterministic_input(*right_seed);
+                let left = deterministic_pair_input(*left_seed);
+                let right = deterministic_pair_input(*right_seed);
                 executable.run_scalar(&[left, right]).unwrap()
             })
             .collect::<Vec<_>>();
-        let packed_left = packed_input(&left_seeds);
-        let packed_right = packed_input(&right_seeds);
+        let packed_left = packed_pair_input(&left_seeds);
+        let packed_right = packed_pair_input(&right_seeds);
         let actual = executable
             .run_batch_scalar(&[packed_left.clone(), packed_right.clone()])
             .unwrap();
