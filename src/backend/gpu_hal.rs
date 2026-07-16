@@ -39,6 +39,7 @@ struct Shared {
     _adapter: RawAdapter,
     _instance: RawInstance,
     limits: wgt::Limits,
+    features: wgt::Features,
 }
 
 #[derive(Clone)]
@@ -78,11 +79,12 @@ impl Device {
         let exposed = adapters.swap_remove(selected);
         let name = exposed.info.name.clone();
         let limits = exposed.capabilities.limits.clone();
-        // SAFETY: empty features and default limits are supported by every exposed
-        // adapter returned by wgpu-hal.
+        let features = exposed.features & wgt::Features::SHADER_F16;
+        // SAFETY: only an adapter-advertised optional feature is requested, and
+        // default limits are supported by every exposed adapter from wgpu-hal.
         let hal::OpenDevice { device, queue } = unsafe {
             exposed.adapter.open(
-                wgt::Features::empty(),
+                features,
                 &wgt::Limits::default(),
                 &wgt::MemoryHints::Performance,
             )
@@ -96,6 +98,7 @@ impl Device {
                     _adapter: exposed.adapter,
                     _instance: instance,
                     limits,
+                    features,
                 }),
             },
             AdapterInfo { name },
@@ -104,6 +107,10 @@ impl Device {
 
     pub(crate) fn limits(&self) -> &wgt::Limits {
         &self.shared.limits
+    }
+
+    pub(crate) fn supports_f16(&self) -> bool {
+        self.shared.features.contains(wgt::Features::SHADER_F16)
     }
 
     pub(crate) fn create_buffer(
@@ -261,12 +268,14 @@ impl Device {
         let module = naga::front::wgsl::Frontend::new()
             .parse(source)
             .map_err(|error| RtError::Inference(format!("invalid GPU shader {label}: {error}")))?;
-        let info = naga::valid::Validator::new(
-            naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::empty(),
-        )
-        .validate(&module)
-        .map_err(|error| RtError::Inference(format!("invalid GPU shader {label}: {error}")))?;
+        let capabilities = if self.supports_f16() {
+            naga::valid::Capabilities::SHADER_FLOAT16
+        } else {
+            naga::valid::Capabilities::empty()
+        };
+        let info = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), capabilities)
+            .validate(&module)
+            .map_err(|error| RtError::Inference(format!("invalid GPU shader {label}: {error}")))?;
         let binding_uses = shader_buffer_bindings(label, &module)?;
         let layout_entries = binding_uses
             .iter()

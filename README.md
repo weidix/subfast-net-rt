@@ -24,6 +24,10 @@ Presence dimensions must be divisible by four to match its exported mask path.
 Both models have optimized CPU execution. AArch64 uses NEON kernels and
 persistent workers; x86_64 selects AVX2+FMA at runtime. The optional GPU feature
 uses Metal on macOS and Vulkan on other native targets through `wgpu-hal`.
+When supported by the adapter, GPU convolution weights use FP16 storage with
+FP32 accumulation. Batched kernels specialize workgroup geometry for the wider
+batch dimension, and Pair Matcher fuses feature construction with its stem
+convolution to avoid an intermediate tensor round trip.
 
 ## Image inference
 

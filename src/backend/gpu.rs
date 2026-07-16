@@ -256,98 +256,6 @@ fn main(
 }
 "#;
 
-const PAIR_FEATURE_TILED_SHADER: &str = r#"
-const INPUT_H: u32 = __INPUT_H__u;
-const INPUT_W: u32 = __INPUT_W__u;
-const INPUT_PLANE: u32 = INPUT_H * INPUT_W;
-const INPUT_ELEMENTS: u32 = INPUT_PLANE * 3u;
-const TILE_H: u32 = 8u;
-const TILE_W: u32 = 16u;
-const TILE_COLUMNS: u32 = (INPUT_W + TILE_W - 1u) / TILE_W;
-const SHARED_H: u32 = TILE_H + 4u;
-const SHARED_W: u32 = TILE_W + 4u;
-const SHARED_PIXELS: u32 = SHARED_H * SHARED_W;
-
-@group(0) @binding(0) var<storage, read> left: array<f32>;
-@group(0) @binding(1) var<storage, read> right: array<f32>;
-@group(0) @binding(2) var<storage, read_write> output: array<f32>;
-
-var<workgroup> mean_value: array<f32, SHARED_PIXELS>;
-var<workgroup> delta: array<f32, SHARED_PIXELS>;
-
-fn value_channel(red_input: f32, green_input: f32, blue_input: f32) -> f32 {
-    let red = red_input * 0.229 + 0.485;
-    let green = green_input * 0.224 + 0.456;
-    let blue = blue_input * 0.225 + 0.406;
-    return (max(max(red, green), blue) - 0.449) / 0.226;
-}
-
-@compute @workgroup_size(128)
-fn main(
-    @builtin(local_invocation_index) local: u32,
-    @builtin(workgroup_id) workgroup: vec3<u32>,
-) {
-    let sample = workgroup.y;
-    let tile_x = workgroup.x % TILE_COLUMNS;
-    let tile_y = workgroup.x / TILE_COLUMNS;
-    let input_base = sample * INPUT_ELEMENTS;
-
-    for (var shared_index = local; shared_index < SHARED_PIXELS; shared_index += 128u) {
-        let shared_x = shared_index % SHARED_W;
-        let shared_y = shared_index / SHARED_W;
-        let input_x = i32(tile_x * TILE_W + shared_x) - 2;
-        let input_y = i32(tile_y * TILE_H + shared_y) - 2;
-        let valid = input_x >= 0 && input_x < i32(INPUT_W)
-            && input_y >= 0 && input_y < i32(INPUT_H);
-        var left_value = 0.0;
-        var right_value = 0.0;
-        if (valid) {
-            let pixel = u32(input_y) * INPUT_W + u32(input_x);
-            left_value = value_channel(
-                left[input_base + pixel],
-                left[input_base + INPUT_PLANE + pixel],
-                left[input_base + INPUT_PLANE * 2u + pixel],
-            );
-            right_value = value_channel(
-                right[input_base + pixel],
-                right[input_base + INPUT_PLANE + pixel],
-                right[input_base + INPUT_PLANE * 2u + pixel],
-            );
-        }
-        mean_value[shared_index] = 0.5 * (left_value + right_value);
-        delta[shared_index] = left_value - right_value;
-    }
-    workgroupBarrier();
-
-    let local_x = local % TILE_W;
-    let local_y = local / TILE_W;
-    let x = tile_x * TILE_W + local_x;
-    let y = tile_y * TILE_H + local_y;
-    if (x >= INPUT_W || y >= INPUT_H) {
-        return;
-    }
-    let pixel = y * INPUT_W + x;
-    let output_base = sample * INPUT_ELEMENTS + pixel * 3u;
-    let center = (local_y + 2u) * SHARED_W + local_x + 2u;
-    let center_delta = delta[center];
-    let y0 = select(y - 2u, 0u, y < 2u);
-    let y1 = min(y + 3u, INPUT_H);
-    let x0 = select(x - 2u, 0u, x < 2u);
-    let x1 = min(x + 3u, INPUT_W);
-    let count = f32((y1 - y0) * (x1 - x0));
-    var background = 0.0;
-    for (var offset_y = 0u; offset_y < 5u; offset_y += 1u) {
-        for (var offset_x = 0u; offset_x < 5u; offset_x += 1u) {
-            background += delta[(local_y + offset_y) * SHARED_W + local_x + offset_x];
-        }
-    }
-    background /= count;
-    output[output_base] = mean_value[center];
-    output[output_base + 1u] = abs(center_delta);
-    output[output_base + 2u] = abs(center_delta - background);
-}
-"#;
-
 const PAIR_TAIL_SHADER: &str = r#"
 const INPUT_H: u32 = __INPUT_H__u;
 const INPUT_W: u32 = __INPUT_W__u;
@@ -756,10 +664,206 @@ fn presence_finish_shader(
         .replace("__REGION_W__", &region_w.to_string())
 }
 
-fn pair_feature_shader(input_h: usize, input_w: usize) -> String {
-    PAIR_FEATURE_TILED_SHADER
-        .replace("__INPUT_H__", &input_h.to_string())
-        .replace("__INPUT_W__", &input_w.to_string())
+fn pair_feature_stem_shader(input_h: usize, input_w: usize, f16_weights: bool) -> String {
+    let enable_f16 = if f16_weights { "enable f16;" } else { "" };
+    let weight_type = if f16_weights {
+        "array<vec4<f16>>"
+    } else {
+        "array<vec4<f32>>"
+    };
+    let weight_value = if f16_weights {
+        "vec4<f32>(weights[weight_index])"
+    } else {
+        "weights[weight_index]"
+    };
+    format!(
+        r#"{enable_f16}
+const INPUT_H: u32 = {input_h}u;
+const INPUT_W: u32 = {input_w}u;
+const OUTPUT_H: u32 = {output_h}u;
+const OUTPUT_W: u32 = {output_w}u;
+const INPUT_PLANE: u32 = INPUT_H * INPUT_W;
+const INPUT_ELEMENTS: u32 = INPUT_PLANE * 3u;
+const OUTPUT_GROUPS: u32 = 4u;
+const TILE_H: u32 = 8u;
+const TILE_W: u32 = 16u;
+const GROUPS_PER_THREAD: u32 = 2u;
+const TILE_COLUMNS: u32 = (OUTPUT_W + TILE_W - 1u) / TILE_W;
+const FEATURE_H: u32 = TILE_H * 2u + 1u;
+const FEATURE_W: u32 = TILE_W * 2u + 1u;
+const RAW_H: u32 = FEATURE_H + 4u;
+const RAW_W: u32 = FEATURE_W + 4u;
+const RAW_PIXELS: u32 = RAW_H * RAW_W;
+const HORIZONTAL_PIXELS: u32 = RAW_H * FEATURE_W;
+const FEATURE_PIXELS: u32 = FEATURE_H * FEATURE_W;
+
+@group(0) @binding(0) var<storage, read> left: array<f32>;
+@group(0) @binding(1) var<storage, read> right: array<f32>;
+@group(0) @binding(2) var<storage, read> weights: {weight_type};
+@group(0) @binding(3) var<storage, read> bias: array<vec4<f32>>;
+@group(0) @binding(4) var<storage, read_write> output: array<vec4<f32>>;
+
+var<workgroup> raw_mean: array<f32, RAW_PIXELS>;
+var<workgroup> raw_delta: array<f32, RAW_PIXELS>;
+var<workgroup> horizontal_delta: array<f32, HORIZONTAL_PIXELS>;
+var<workgroup> features: array<f32, FEATURE_PIXELS * 3u>;
+
+fn value_channel(red_input: f32, green_input: f32, blue_input: f32) -> f32 {{
+    let red = red_input * 0.229 + 0.485;
+    let green = green_input * 0.224 + 0.456;
+    let blue = blue_input * 0.225 + 0.406;
+    return (max(max(red, green), blue) - 0.449) / 0.226;
+}}
+
+fn fast_exp(value: f32) -> f32 {{
+    let x = clamp(value, -80.0, 80.0);
+    let scaled = x * 1.4426950408889634;
+    let n = sign(scaled) * floor(abs(scaled) + 0.5);
+    let r = fma(-n, 0.6931471805599453, x);
+    var polynomial = 1.0 / 720.0;
+    polynomial = fma(polynomial, r, 1.0 / 120.0);
+    polynomial = fma(polynomial, r, 1.0 / 24.0);
+    polynomial = fma(polynomial, r, 1.0 / 6.0);
+    polynomial = fma(polynomial, r, 0.5);
+    polynomial = fma(polynomial, r, 1.0);
+    polynomial = fma(polynomial, r, 1.0);
+    let exponent = bitcast<f32>(u32(i32(n) + 127) << 23u);
+    return polynomial * exponent;
+}}
+
+fn silu(value: vec4<f32>) -> vec4<f32> {{
+    return vec4<f32>(
+        value.x / (1.0 + fast_exp(-value.x)),
+        value.y / (1.0 + fast_exp(-value.y)),
+        value.z / (1.0 + fast_exp(-value.z)),
+        value.w / (1.0 + fast_exp(-value.w)),
+    );
+}}
+
+@compute @workgroup_size(256)
+fn main(
+    @builtin(local_invocation_index) local: u32,
+    @builtin(workgroup_id) workgroup: vec3<u32>,
+) {{
+    let sample = workgroup.y;
+    let tile_x = workgroup.x % TILE_COLUMNS;
+    let tile_y = workgroup.x / TILE_COLUMNS;
+    let raw_origin_x = i32(tile_x * TILE_W * 2u) - 3;
+    let raw_origin_y = i32(tile_y * TILE_H * 2u) - 3;
+    let input_base = sample * INPUT_ELEMENTS;
+
+    for (var index = local; index < RAW_PIXELS; index += 256u) {{
+        let raw_x = index % RAW_W;
+        let raw_y = index / RAW_W;
+        let input_x = raw_origin_x + i32(raw_x);
+        let input_y = raw_origin_y + i32(raw_y);
+        let valid = input_x >= 0 && input_x < i32(INPUT_W)
+            && input_y >= 0 && input_y < i32(INPUT_H);
+        var left_value = 0.0;
+        var right_value = 0.0;
+        if (valid) {{
+            let pixel = u32(input_y) * INPUT_W + u32(input_x);
+            left_value = value_channel(
+                left[input_base + pixel],
+                left[input_base + INPUT_PLANE + pixel],
+                left[input_base + INPUT_PLANE * 2u + pixel],
+            );
+            right_value = value_channel(
+                right[input_base + pixel],
+                right[input_base + INPUT_PLANE + pixel],
+                right[input_base + INPUT_PLANE * 2u + pixel],
+            );
+        }}
+        raw_mean[index] = 0.5 * (left_value + right_value);
+        raw_delta[index] = left_value - right_value;
+    }}
+    workgroupBarrier();
+
+    for (var index = local; index < HORIZONTAL_PIXELS; index += 256u) {{
+        let feature_x = index % FEATURE_W;
+        let raw_y = index / FEATURE_W;
+        var sum = 0.0;
+        for (var offset = 0u; offset < 5u; offset += 1u) {{
+            sum += raw_delta[raw_y * RAW_W + feature_x + offset];
+        }}
+        horizontal_delta[index] = sum;
+    }}
+    workgroupBarrier();
+
+    for (var index = local; index < FEATURE_PIXELS; index += 256u) {{
+        let feature_x = index % FEATURE_W;
+        let feature_y = index / FEATURE_W;
+        let input_x = i32(tile_x * TILE_W * 2u + feature_x) - 1;
+        let input_y = i32(tile_y * TILE_H * 2u + feature_y) - 1;
+        let valid = input_x >= 0 && input_x < i32(INPUT_W)
+            && input_y >= 0 && input_y < i32(INPUT_H);
+        var mean = 0.0;
+        var center_delta = 0.0;
+        var residual = 0.0;
+        if (valid) {{
+            let center = (feature_y + 2u) * RAW_W + feature_x + 2u;
+            mean = raw_mean[center];
+            center_delta = raw_delta[center];
+            var background = 0.0;
+            for (var offset_y = 0u; offset_y < 5u; offset_y += 1u) {{
+                background += horizontal_delta[(feature_y + offset_y) * FEATURE_W + feature_x];
+            }}
+            let y = u32(input_y);
+            let x = u32(input_x);
+            let y0 = select(y - 2u, 0u, y < 2u);
+            let y1 = min(y + 3u, INPUT_H);
+            let x0 = select(x - 2u, 0u, x < 2u);
+            let x1 = min(x + 3u, INPUT_W);
+            background /= f32((y1 - y0) * (x1 - x0));
+            residual = abs(center_delta - background);
+        }}
+        let feature_base = index * 3u;
+        features[feature_base] = mean;
+        features[feature_base + 1u] = abs(center_delta);
+        features[feature_base + 2u] = residual;
+    }}
+    workgroupBarrier();
+
+    let spatial = local / (OUTPUT_GROUPS / GROUPS_PER_THREAD);
+    let output_group_base = (local % (OUTPUT_GROUPS / GROUPS_PER_THREAD)) * GROUPS_PER_THREAD;
+    let local_x = spatial % TILE_W;
+    let local_y = spatial / TILE_W;
+    let output_x = tile_x * TILE_W + local_x;
+    let output_y = tile_y * TILE_H + local_y;
+    if (output_x >= OUTPUT_W || output_y >= OUTPUT_H) {{
+        return;
+    }}
+    var sum0 = bias[output_group_base];
+    var sum1 = bias[output_group_base + 1u];
+    for (var kernel_y = 0u; kernel_y < 3u; kernel_y += 1u) {{
+        for (var kernel_x = 0u; kernel_x < 3u; kernel_x += 1u) {{
+            let feature_base = ((local_y * 2u + kernel_y) * FEATURE_W
+                + local_x * 2u + kernel_x) * 3u;
+            let kernel_base = (kernel_y * 3u + kernel_x) * 3u;
+            for (var channel = 0u; channel < 3u; channel += 1u) {{
+                let weight_base = (kernel_base + channel) * OUTPUT_GROUPS;
+                let value = vec4<f32>(features[feature_base + channel]);
+                var weight_index = weight_base + output_group_base;
+                sum0 = fma(value, {weight_value}, sum0);
+                weight_index = weight_base + output_group_base + 1u;
+                sum1 = fma(value, {weight_value}, sum1);
+            }}
+        }}
+    }}
+    let output_base = sample * OUTPUT_H * OUTPUT_W * OUTPUT_GROUPS
+        + (output_y * OUTPUT_W + output_x) * OUTPUT_GROUPS;
+    output[output_base + output_group_base] = silu(sum0);
+    output[output_base + output_group_base + 1u] = silu(sum1);
+}}
+"#,
+        input_h = input_h,
+        input_w = input_w,
+        output_h = input_h.div_ceil(2),
+        output_w = input_w.div_ceil(2),
+        enable_f16 = enable_f16,
+        weight_type = weight_type,
+        weight_value = weight_value,
+    )
 }
 
 fn pair_tail_shader(input_h: usize, input_w: usize) -> String {
@@ -810,7 +914,13 @@ struct SeparableParams {
     stride_h: usize,
 }
 
-fn fused_separable_spatial_shader(params: SeparableParams) -> String {
+fn fused_separable_spatial_shader(params: SeparableParams, f16_weights: bool) -> String {
+    let enable_f16 = if f16_weights { "enable f16;" } else { "" };
+    let weight_type = if f16_weights {
+        "array<vec4<f16>>"
+    } else {
+        "array<vec4<f32>>"
+    };
     let output_groups = params.out_channels / 4;
     let accumulators = (0..output_groups)
         .map(|group| format!("    var sum{group} = pointwise_bias[{group}u];"))
@@ -819,8 +929,16 @@ fn fused_separable_spatial_shader(params: SeparableParams) -> String {
     let updates = (0..4)
         .flat_map(|component| {
             (0..output_groups).map(move |group| {
+                let weight = format!(
+                    "pointwise_weights[(input_group * 4u + {component}u) * OUTPUT_GROUPS + {group}u]"
+                );
+                let weight = if f16_weights {
+                    format!("vec4<f32>({weight})")
+                } else {
+                    weight
+                };
                 format!(
-                    "        sum{group} = fma(\n            vec4<f32>(depthwise_value[{component}u]),\n            pointwise_weights[(input_group * 4u + {component}u)\n                * OUTPUT_GROUPS + {group}u],\n            sum{group},\n        );"
+                    "        sum{group} = fma(\n            vec4<f32>(depthwise_value[{component}u]),\n            {weight},\n            sum{group},\n        );"
                 )
             })
         })
@@ -835,7 +953,7 @@ fn fused_separable_spatial_shader(params: SeparableParams) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        r#"
+        r#"{enable_f16}
 const INPUT_H: u32 = {input_h}u;
 const INPUT_W: u32 = {input_w}u;
 const INPUT_GROUPS: u32 = {input_groups}u;
@@ -845,9 +963,9 @@ const OUTPUT_GROUPS: u32 = {output_groups}u;
 const STRIDE_H: u32 = {stride_h}u;
 
 @group(0) @binding(0) var<storage, read> source: array<vec4<f32>>;
-@group(0) @binding(1) var<storage, read> depthwise_weights: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> depthwise_weights: {weight_type};
 @group(0) @binding(2) var<storage, read> depthwise_bias: array<vec4<f32>>;
-@group(0) @binding(3) var<storage, read> pointwise_weights: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read> pointwise_weights: {weight_type};
 @group(0) @binding(4) var<storage, read> pointwise_bias: array<vec4<f32>>;
 @group(0) @binding(5) var<storage, read_write> destination: array<vec4<f32>>;
 
@@ -903,7 +1021,7 @@ fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {{
                     + input_group;
                 depthwise_value = fma(
                     source[source_index],
-                    depthwise_weights[weight_index],
+                    vec4<f32>(depthwise_weights[weight_index]),
                     depthwise_value,
                 );
             }}
@@ -921,52 +1039,141 @@ fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {{
         output_w = params.output_w,
         output_groups = output_groups,
         stride_h = params.stride_h,
+        enable_f16 = enable_f16,
+        weight_type = weight_type,
     )
 }
 
-fn spatial_dense_conv_shader(params: ConvParams) -> String {
-    let output_groups = params.out_channels / 4;
-    let groups_per_invocation = output_groups;
-    let blocks = 1;
-    let accumulators = (0..groups_per_invocation)
-        .map(|group| format!("    var sum{group} = bias[output_group_base + {group}u];"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let updates = (0..groups_per_invocation)
-        .map(|group| {
-            format!(
-                "                sum{group} = fma(\n                    vec4<f32>(source_value),\n                    weights[weight_base + output_group_base + {group}u],\n                    sum{group},\n                );"
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let stores = (0..groups_per_invocation)
-        .map(|group| {
-            let value = if params.activation {
-                format!("silu(sum{group})")
-            } else {
-                format!("sum{group}")
-            };
-            format!(
-                "    destination[sample * OUTPUT_H * OUTPUT_W * OUT_GROUPS\n        + spatial * OUT_GROUPS + output_group_base + {group}u] = {value};"
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let source_index = if params.source_nchw {
-        r#"sample * INPUT_H * INPUT_W * IN_CHANNELS
-                    + input_channel * INPUT_H * INPUT_W
-                    + u32(input_y) * INPUT_W + u32(input_x)"#
+fn spatial_dense_conv_shader(
+    params: ConvParams,
+    f16_weights: bool,
+    batch_tile: usize,
+    workgroup_size: usize,
+) -> String {
+    let enable_f16 = if f16_weights { "enable f16;" } else { "" };
+    let weight_type = if f16_weights {
+        "array<vec4<f16>>"
     } else {
-        r#"sample * INPUT_H * INPUT_W * IN_CHANNELS
-                    + (u32(input_y) * INPUT_W + u32(input_x)) * IN_CHANNELS
-                    + input_channel"#
+        "array<vec4<f32>>"
     };
+    let output_groups = params.out_channels / 4;
+    let groups_per_invocation = output_groups.min(4);
+    let blocks = output_groups.div_ceil(groups_per_invocation);
+    let accumulators = (0..batch_tile)
+        .flat_map(|sample| {
+            (0..groups_per_invocation).map(move |group| {
+                format!("    var sum{sample}_{group} = bias[output_group_base + {group}u];")
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let vector_source = !params.source_nchw && params.in_channels.is_multiple_of(4);
+    let source_type = if vector_source {
+        "array<vec4<f32>>"
+    } else {
+        "array<f32>"
+    };
+    let weight = |expression: String| {
+        if f16_weights {
+            format!("vec4<f32>({expression})")
+        } else {
+            expression
+        }
+    };
+    let channel_loop = if vector_source {
+        let source_values = (0..batch_tile)
+            .map(|sample| {
+                format!(
+                    "                let source_value{sample} = source[(sample_base + {sample}u) * INPUT_H * INPUT_W * INPUT_GROUPS\n                    + (u32(input_y) * INPUT_W + u32(input_x)) * INPUT_GROUPS\n                    + input_group];"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let components = ["x", "y", "z", "w"];
+        let component_blocks = components
+            .into_iter()
+            .enumerate()
+            .map(|(component, name)| {
+                let weight_loads = (0..groups_per_invocation)
+                    .map(|group| {
+                        let value = weight(format!(
+                            "weights[weight_base + {component}u * OUT_GROUPS + output_group_base + {group}u]"
+                        ));
+                        format!("                    let weight{group} = {value};")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let updates = (0..batch_tile)
+                    .flat_map(|sample| {
+                        (0..groups_per_invocation).map(move |group| {
+                            format!(
+                                "                    sum{sample}_{group} = fma(\n                        vec4<f32>(source_value{sample}.{name}),\n                        weight{group},\n                        sum{sample}_{group},\n                    );"
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("                {{\n{weight_loads}\n{updates}\n                }}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "            for (var input_group = 0u; input_group < INPUT_GROUPS; input_group += 1u) {{\n{source_values}\n                let weight_base = (kernel_base * IN_CHANNELS + input_group * 4u) * OUT_GROUPS;\n{component_blocks}\n            }}"
+        )
+    } else {
+        let source_values = (0..batch_tile)
+            .map(|sample| {
+                let source_index = format!(
+                    "(sample_base + {sample}u) * INPUT_H * INPUT_W * IN_CHANNELS\n                    + input_channel * INPUT_H * INPUT_W\n                    + u32(input_y) * INPUT_W + u32(input_x)"
+                );
+                format!("                let source_value{sample} = source[{source_index}];")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let weight_loads = (0..groups_per_invocation)
+            .map(|group| {
+                let value = weight(format!(
+                    "weights[weight_base + output_group_base + {group}u]"
+                ));
+                format!("                let weight{group} = {value};")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let updates = (0..batch_tile)
+            .flat_map(|sample| {
+                (0..groups_per_invocation).map(move |group| {
+                    format!(
+                        "                sum{sample}_{group} = fma(\n                    vec4<f32>(source_value{sample}),\n                    weight{group},\n                    sum{sample}_{group},\n                );"
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!(
+            "            for (var input_channel = 0u; input_channel < IN_CHANNELS; input_channel += 1u) {{\n{source_values}\n                let weight_base = (kernel_base * IN_CHANNELS + input_channel) * OUT_GROUPS;\n{weight_loads}\n{updates}\n            }}"
+        )
+    };
+    let stores = (0..batch_tile)
+        .flat_map(|sample| {
+            (0..groups_per_invocation).map(move |group| {
+                let value = if params.activation {
+                    format!("silu(sum{sample}_{group})")
+                } else {
+                    format!("sum{sample}_{group}")
+                };
+                format!(
+                    "    destination[(sample_base + {sample}u) * OUTPUT_H * OUTPUT_W * OUT_GROUPS\n        + spatial * OUT_GROUPS + output_group_base + {group}u] = {value};"
+                )
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     format!(
-        r#"
+        r#"{enable_f16}
 const INPUT_H: u32 = {input_h}u;
 const INPUT_W: u32 = {input_w}u;
 const IN_CHANNELS: u32 = {in_channels}u;
+const INPUT_GROUPS: u32 = (IN_CHANNELS + 3u) / 4u;
 const OUTPUT_H: u32 = {output_h}u;
 const OUTPUT_W: u32 = {output_w}u;
 const OUT_GROUPS: u32 = {out_groups}u;
@@ -980,26 +1187,15 @@ const PADDING_H: u32 = {padding_h}u;
 const PADDING_W: u32 = {padding_w}u;
 const DILATION_H: u32 = {dilation_h}u;
 const DILATION_W: u32 = {dilation_w}u;
+const BATCH_TILE: u32 = {batch_tile}u;
 
-@group(0) @binding(0) var<storage, read> source: array<f32>;
-@group(0) @binding(1) var<storage, read> weights: array<vec4<f32>>;
+@group(0) @binding(0) var<storage, read> source: {source_type};
+@group(0) @binding(1) var<storage, read> weights: {weight_type};
 @group(0) @binding(2) var<storage, read> bias: array<vec4<f32>>;
 @group(0) @binding(3) var<storage, read_write> destination: array<vec4<f32>>;
 
 fn fast_exp(value: f32) -> f32 {{
-    let x = clamp(value, -80.0, 80.0);
-    let scaled = x * 1.4426950408889634;
-    let n = sign(scaled) * floor(abs(scaled) + 0.5);
-    let r = fma(-n, 0.6931471805599453, x);
-    var polynomial = 1.0 / 720.0;
-    polynomial = fma(polynomial, r, 1.0 / 120.0);
-    polynomial = fma(polynomial, r, 1.0 / 24.0);
-    polynomial = fma(polynomial, r, 1.0 / 6.0);
-    polynomial = fma(polynomial, r, 0.5);
-    polynomial = fma(polynomial, r, 1.0);
-    polynomial = fma(polynomial, r, 1.0);
-    let exponent = bitcast<f32>(u32(i32(n) + 127) << 23u);
-    return polynomial * exponent;
+    return exp(value);
 }}
 
 fn silu(value: vec4<f32>) -> vec4<f32> {{
@@ -1011,10 +1207,10 @@ fn silu(value: vec4<f32>) -> vec4<f32> {{
     );
 }}
 
-@compute @workgroup_size(64)
+@compute @workgroup_size({workgroup_size})
 fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {{
     let local = invocation.x;
-    let sample = invocation.y;
+    let sample_base = invocation.y * BATCH_TILE;
     let spatial = local / BLOCKS;
     let output_group_base = (local % BLOCKS) * BLOCK_GROUPS;
     let output_x = spatial % OUTPUT_W;
@@ -1034,12 +1230,7 @@ fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {{
                 continue;
             }}
             let kernel_base = kernel_y * KERNEL_W + kernel_x;
-            for (var input_channel = 0u; input_channel < IN_CHANNELS; input_channel += 1u) {{
-                let source_index = {source_index};
-                let source_value = source[source_index];
-                let weight_base = (kernel_base * IN_CHANNELS + input_channel) * OUT_GROUPS;
-{updates}
-            }}
+{channel_loop}
         }}
     }}
 {stores}
@@ -1061,12 +1252,30 @@ fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {{
         padding_w = params.padding[1],
         dilation_h = params.dilation[0],
         dilation_w = params.dilation[1],
+        batch_tile = batch_tile,
+        enable_f16 = enable_f16,
+        weight_type = weight_type,
+        source_type = source_type,
+        workgroup_size = workgroup_size,
     )
 }
 
-fn tiled_dense_conv_shader(params: ConvParams) -> String {
-    let accumulators = (0..4)
-        .map(|index| format!("    var sum{index} = bias[output_group];"))
+fn tiled_dense_conv_shader(params: ConvParams, f16_weights: bool, batch_tile: usize) -> String {
+    let enable_f16 = if f16_weights { "enable f16;" } else { "" };
+    let weight_type = if f16_weights {
+        "array<vec4<f16>>"
+    } else {
+        "array<vec4<f32>>"
+    };
+    let weight_value = if f16_weights {
+        "vec4<f32>(weights[weight_index])"
+    } else {
+        "weights[weight_index]"
+    };
+    let accumulators = (0..batch_tile)
+        .flat_map(|sample| {
+            (0..4).map(move |index| format!("    var sum{sample}_{index} = bias[output_group];"))
+        })
         .collect::<Vec<_>>()
         .join("\n");
     let input_x = (0..4)
@@ -1077,45 +1286,49 @@ fn tiled_dense_conv_shader(params: ConvParams) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let updates = (0..4)
-        .map(|index| {
-            let source_index = if params.source_nchw {
+    let updates = (0..batch_tile)
+        .flat_map(|sample| {
+            (0..4).map(move |index| {
+                let source_index = if params.source_nchw {
+                    format!(
+                        "(sample_base + {sample}u) * INPUT_H * INPUT_W * IN_CHANNELS\n                        + input_channel * INPUT_H * INPUT_W\n                        + u32(input_y) * INPUT_W + u32(input_x{index})"
+                    )
+                } else {
+                    format!(
+                        "(sample_base + {sample}u) * INPUT_H * INPUT_W * IN_CHANNELS\n                        + (u32(input_y) * INPUT_W + u32(input_x{index})) * IN_CHANNELS\n                        + input_channel"
+                    )
+                };
                 format!(
-                    "sample * INPUT_H * INPUT_W * IN_CHANNELS\n                        + input_channel * INPUT_H * INPUT_W\n                        + u32(input_y) * INPUT_W + u32(input_x{index})"
-                )
-            } else {
-                format!(
-                    "sample * INPUT_H * INPUT_W * IN_CHANNELS\n                        + (u32(input_y) * INPUT_W + u32(input_x{index})) * IN_CHANNELS\n                        + input_channel"
-                )
-            };
-            format!(
-                r#"                if (input_x{index} >= 0 && input_x{index} < i32(INPUT_W)) {{
-                    let source_index{index} = {source_index};
-                    sum{index} = fma(
-                        vec4<f32>(source[source_index{index}]),
+                    r#"                if (input_x{index} >= 0 && input_x{index} < i32(INPUT_W)) {{
+                    let source_index{sample}_{index} = {source_index};
+                    sum{sample}_{index} = fma(
+                        vec4<f32>(source[source_index{sample}_{index}]),
                         weight,
-                        sum{index},
+                        sum{sample}_{index},
                     );
                 }}"#
-            )
+                )
+            })
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let stores = (0..4)
-        .map(|index| {
-            let value = if params.activation {
-                format!("silu(sum{index})")
-            } else {
-                format!("sum{index}")
-            };
-            format!(
-                "    destination[sample * OUTPUT_H * OUTPUT_W * OUT_GROUPS\n        + (spatial_base + {index}u) * OUT_GROUPS + output_group] = {value};"
-            )
+    let stores = (0..batch_tile)
+        .flat_map(|sample| {
+            (0..4).map(move |index| {
+                let value = if params.activation {
+                    format!("silu(sum{sample}_{index})")
+                } else {
+                    format!("sum{sample}_{index}")
+                };
+                format!(
+                    "    destination[(sample_base + {sample}u) * OUTPUT_H * OUTPUT_W * OUT_GROUPS\n        + (spatial_base + {index}u) * OUT_GROUPS + output_group] = {value};"
+                )
+            })
         })
         .collect::<Vec<_>>()
         .join("\n");
     format!(
-        r#"
+        r#"{enable_f16}
 const INPUT_H: u32 = {input_h}u;
 const INPUT_W: u32 = {input_w}u;
 const IN_CHANNELS: u32 = {in_channels}u;
@@ -1130,9 +1343,10 @@ const PADDING_H: u32 = {padding_h}u;
 const PADDING_W: u32 = {padding_w}u;
 const DILATION_H: u32 = {dilation_h}u;
 const DILATION_W: u32 = {dilation_w}u;
+const BATCH_TILE: u32 = {batch_tile}u;
 
 @group(0) @binding(0) var<storage, read> source: array<f32>;
-@group(0) @binding(1) var<storage, read> weights: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> weights: {weight_type};
 @group(0) @binding(2) var<storage, read> bias: array<vec4<f32>>;
 @group(0) @binding(3) var<storage, read_write> destination: array<vec4<f32>>;
 
@@ -1163,7 +1377,7 @@ fn silu(value: vec4<f32>) -> vec4<f32> {{
 
 @compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {{
-    let sample = invocation.y;
+    let sample_base = invocation.y * BATCH_TILE;
     let local = invocation.x;
     let output_group = local % OUT_GROUPS;
     let spatial_base = (local / OUT_GROUPS) * 4u;
@@ -1183,7 +1397,7 @@ fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {{
             for (var input_channel = 0u; input_channel < IN_CHANNELS; input_channel += 1u) {{
                 let weight_index = (kernel_base * IN_CHANNELS + input_channel)
                     * OUT_GROUPS + output_group;
-                let weight = weights[weight_index];
+                let weight = {weight_value};
 {updates}
             }}
         }}
@@ -1205,24 +1419,40 @@ fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {{
         padding_w = params.padding[1],
         dilation_h = params.dilation[0],
         dilation_w = params.dilation[1],
+        batch_tile = batch_tile,
+        enable_f16 = enable_f16,
+        weight_type = weight_type,
+        weight_value = weight_value,
     )
 }
 
-fn vector_conv_shader(params: ConvParams) -> String {
+fn vector_conv_shader(params: ConvParams, f16_weights: bool, batch_tile: usize) -> String {
     if !params.depthwise {
-        return tiled_dense_conv_shader(params);
+        return tiled_dense_conv_shader(params, f16_weights, batch_tile);
     }
+    let enable_f16 = if f16_weights { "enable f16;" } else { "" };
+    let weight_type = if f16_weights {
+        "array<vec4<f16>>"
+    } else {
+        "array<vec4<f32>>"
+    };
+    let weight_value = if f16_weights {
+        "vec4<f32>(weights[weight_index])"
+    } else {
+        "weights[weight_index]"
+    };
     let (source_type, accumulate) = if params.depthwise {
         (
             "array<vec4<f32>>",
-            r#"
+            format!(
+                r#"
             let source_index = sample * INPUT_H * INPUT_W * OUT_GROUPS
                 + (u32(input_y) * INPUT_W + u32(input_x)) * OUT_GROUPS
                 + output_group;
             let weight_index = kernel_base * OUT_GROUPS + output_group;
-            sum = fma(source[source_index], weights[weight_index], sum);
+            sum = fma(source[source_index], {weight_value}, sum);
 "#
-            .to_owned(),
+            ),
         )
     } else {
         let source_index = if params.source_nchw {
@@ -1258,7 +1488,7 @@ fn vector_conv_shader(params: ConvParams) -> String {
         "sum"
     };
     format!(
-        r#"
+        r#"{enable_f16}
 const INPUT_H: u32 = {input_h}u;
 const INPUT_W: u32 = {input_w}u;
 const IN_CHANNELS: u32 = {in_channels}u;
@@ -1275,7 +1505,7 @@ const DILATION_H: u32 = {dilation_h}u;
 const DILATION_W: u32 = {dilation_w}u;
 
 @group(0) @binding(0) var<storage, read> source: {source_type};
-@group(0) @binding(1) var<storage, read> weights: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read> weights: {weight_type};
 @group(0) @binding(2) var<storage, read> bias: array<vec4<f32>>;
 @group(0) @binding(3) var<storage, read_write> destination: array<vec4<f32>>;
 
@@ -1347,6 +1577,8 @@ fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {{
         padding_w = params.padding[1],
         dilation_h = params.dilation[0],
         dilation_w = params.dilation[1],
+        enable_f16 = enable_f16,
+        weight_type = weight_type,
     )
 }
 
@@ -1364,9 +1596,26 @@ impl GpuLayer {
             .checked_mul(params.output_w)
             .and_then(|value| value.checked_mul(params.out_channels))
             .ok_or_else(|| RtError::Inference("GPU layer output size overflow".into()))?;
+        let spatial_dense = !params.depthwise
+            && (params.kernel == [5, 5] || (params.kernel == [3, 3] && params.in_channels >= 16))
+            && (params.output_h * params.output_w).is_multiple_of(WORKGROUP_SIZE);
+        let tiled_dense = !params.depthwise && params.output_w.is_multiple_of(4);
+        let outputs_per_invocation = if params.depthwise {
+            4
+        } else if spatial_dense {
+            params.out_channels.min(16)
+        } else {
+            16
+        };
+        let vector_elements = elements / outputs_per_invocation;
+        let specialized = params.out_channels.is_multiple_of(4)
+            && (params.depthwise || spatial_dense || tiled_dense)
+            && vector_elements.is_multiple_of(WORKGROUP_SIZE);
+        let f16_weights = specialized && context.device.supports_f16();
+        let weight_bytes = weight_bytes(weights, f16_weights);
         let weight_buffer = context.device.create_buffer_init(
             "subfast ROI weights",
-            f32_bytes(weights),
+            &weight_bytes,
             hal::BufferUses::STORAGE_READ_ONLY,
         )?;
         let bias_buffer = context.device.create_buffer_init(
@@ -1375,45 +1624,34 @@ impl GpuLayer {
             hal::BufferUses::STORAGE_READ_ONLY,
         )?;
 
-        if params.out_channels.is_multiple_of(4) {
-            let spatial_dense = !params.depthwise
-                && params.kernel == [5, 5]
-                && (params.output_h * params.output_w).is_multiple_of(WORKGROUP_SIZE);
-            let tiled_dense = !params.depthwise && params.output_w.is_multiple_of(4);
-            let outputs_per_invocation = if params.depthwise {
-                4
-            } else if spatial_dense {
-                params.out_channels
+        if specialized {
+            let workgroup_size = if spatial_dense && params.in_channels >= 16 {
+                32
             } else {
-                16
+                WORKGROUP_SIZE
             };
-            let vector_elements = elements / outputs_per_invocation;
-            if (params.depthwise || spatial_dense || tiled_dense)
-                && vector_elements.is_multiple_of(WORKGROUP_SIZE)
-            {
-                let shader_source = if spatial_dense {
-                    spatial_dense_conv_shader(params)
-                } else {
-                    vector_conv_shader(params)
-                };
-                let pipeline = create_pipeline(
-                    &context.device,
-                    "subfast vector ROI convolution",
-                    &shader_source,
-                )?;
-                let bind_group = sequential_bind_group(
-                    &context.device,
-                    &pipeline,
-                    "subfast vector ROI convolution bindings",
-                    &[source, &weight_buffer, &bias_buffer, target],
-                )?;
-                return Ok(Self {
-                    pipeline: Some(pipeline),
-                    bind_group,
-                    workgroups_per_sample: (vector_elements / WORKGROUP_SIZE) as u32,
-                    _resources: vec![weight_buffer, bias_buffer],
-                });
-            }
+            let shader_source = if spatial_dense {
+                spatial_dense_conv_shader(params, f16_weights, 1, workgroup_size)
+            } else {
+                vector_conv_shader(params, f16_weights, 1)
+            };
+            let pipeline = create_pipeline(
+                &context.device,
+                "subfast vector ROI convolution",
+                &shader_source,
+            )?;
+            let bind_group = sequential_bind_group(
+                &context.device,
+                &pipeline,
+                "subfast vector ROI convolution bindings",
+                &[source, &weight_buffer, &bias_buffer, target],
+            )?;
+            return Ok(Self {
+                pipeline: Some(pipeline),
+                bind_group,
+                workgroups_per_sample: (vector_elements / workgroup_size) as u32,
+                _resources: vec![weight_buffer, bias_buffer],
+            });
         }
 
         let values = [
@@ -1480,9 +1718,12 @@ impl GpuLayer {
                 "unsupported fused separable convolution shape".into(),
             ));
         }
+        let f16_weights = context.device.supports_f16();
+        let depthwise_weight_bytes = weight_bytes(depthwise_weights, f16_weights);
+        let pointwise_weight_bytes = weight_bytes(pointwise_weights, f16_weights);
         let depthwise_weight_buffer = context.device.create_buffer_init(
             "subfast fused depthwise weights",
-            f32_bytes(depthwise_weights),
+            &depthwise_weight_bytes,
             hal::BufferUses::STORAGE_READ_ONLY,
         )?;
         let depthwise_bias_buffer = context.device.create_buffer_init(
@@ -1492,7 +1733,7 @@ impl GpuLayer {
         )?;
         let pointwise_weight_buffer = context.device.create_buffer_init(
             "subfast fused pointwise weights",
-            f32_bytes(pointwise_weights),
+            &pointwise_weight_bytes,
             hal::BufferUses::STORAGE_READ_ONLY,
         )?;
         let pointwise_bias_buffer = context.device.create_buffer_init(
@@ -1503,7 +1744,7 @@ impl GpuLayer {
         let pipeline = create_pipeline(
             &context.device,
             "subfast fused separable convolution",
-            &fused_separable_spatial_shader(params),
+            &fused_separable_spatial_shader(params, f16_weights),
         )?;
         let bind_group = sequential_bind_group(
             &context.device,
@@ -1755,7 +1996,6 @@ impl ConvParams {
 struct PairGpu {
     left_input: hal::Buffer,
     right_input: hal::Buffer,
-    _features_buffer: hal::Buffer,
     _stage_a: hal::Buffer,
     _stage_b: hal::Buffer,
     output: hal::Buffer,
@@ -1789,13 +2029,6 @@ impl PairGpu {
             input_elements,
             hal::BufferUses::MAP_WRITE,
         )?;
-        let features_buffer = storage_buffer(
-            &context.device,
-            "subfast pair features",
-            max_batch,
-            input_elements,
-            hal::BufferUses::empty(),
-        )?;
         let stage_a = storage_buffer(
             &context.device,
             "subfast pair stage A",
@@ -1828,65 +2061,60 @@ impl PairGpu {
         let (context_dw_w, context_dw_b) = packed_depthwise(model, "context.0", 48)?;
         let (context_pw_w, context_pw_b) = packed_dense(model, "context.3", 48, 48, [1, 1])?;
 
+        let f16_stem_weights = context.device.supports_f16();
+        let stem_weight_buffer = context.device.create_buffer_init(
+            "subfast fused pair feature stem weights",
+            &weight_bytes(&stem_weights, f16_stem_weights),
+            hal::BufferUses::STORAGE_READ_ONLY,
+        )?;
+        let stem_bias_buffer = context.device.create_buffer_init(
+            "subfast fused pair feature stem bias",
+            f32_bytes(&stem_b),
+            hal::BufferUses::STORAGE_READ_ONLY,
+        )?;
         let feature_pipeline = create_pipeline(
             &context.device,
-            "subfast pair features",
-            &pair_feature_shader(input_h, input_w),
+            "subfast fused pair features and stem",
+            &pair_feature_stem_shader(input_h, input_w, f16_stem_weights),
         )?;
         let features = GpuKernel {
             pipeline: feature_pipeline.clone(),
             bind_group: sequential_bind_group(
                 &context.device,
                 &feature_pipeline,
-                "subfast pair feature bindings",
-                &[&left_input, &right_input, &features_buffer],
+                "subfast fused pair feature and stem bindings",
+                &[
+                    &left_input,
+                    &right_input,
+                    &stem_weight_buffer,
+                    &stem_bias_buffer,
+                    &stage_a,
+                ],
             )?,
-            workgroups_per_sample: (input_h.div_ceil(8) * input_w.div_ceil(16)) as u32,
-            _resources: Vec::new(),
+            workgroups_per_sample: (stem_h.div_ceil(8) * stem_w.div_ceil(16)) as u32,
+            _resources: vec![stem_weight_buffer, stem_bias_buffer],
         };
 
-        let mut layers = vec![
-            GpuLayer::new(
-                context,
-                &features_buffer,
-                &stage_a,
-                &stem_weights,
-                &stem_b,
-                ConvParams::dense(
-                    input_h,
-                    input_w,
-                    3,
-                    stem_h,
-                    stem_w,
-                    16,
-                    [3, 3],
-                    [2, 2],
-                    [1, 1],
-                    [1, 1],
-                    true,
-                ),
-            )?,
-            GpuLayer::new(
-                context,
-                &stage_a,
-                &stage_b,
-                &down_weights,
-                &down_b,
-                ConvParams::dense(
-                    stem_h,
-                    stem_w,
-                    16,
-                    down_h,
-                    down_w,
-                    32,
-                    [3, 3],
-                    [2, 2],
-                    [1, 1],
-                    [1, 1],
-                    true,
-                ),
-            )?,
-        ];
+        let mut layers = vec![GpuLayer::new(
+            context,
+            &stage_a,
+            &stage_b,
+            &down_weights,
+            &down_b,
+            ConvParams::dense(
+                stem_h,
+                stem_w,
+                16,
+                down_h,
+                down_w,
+                32,
+                [3, 3],
+                [2, 2],
+                [1, 1],
+                [1, 1],
+                true,
+            ),
+        )?];
 
         let fused_separable = (down_h * down_w).is_multiple_of(WORKGROUP_SIZE)
             && (final_h * final_w).is_multiple_of(WORKGROUP_SIZE)
@@ -2101,7 +2329,6 @@ impl PairGpu {
         Ok(Self {
             left_input,
             right_input,
-            _features_buffer: features_buffer,
             _stage_a: stage_a,
             _stage_b: stage_b,
             output,
@@ -2366,6 +2593,17 @@ fn softplus(value: f32) -> f32 {
         value
     } else {
         value.exp().ln_1p()
+    }
+}
+
+fn weight_bytes(values: &[f32], f16: bool) -> Vec<u8> {
+    if f16 {
+        values
+            .iter()
+            .flat_map(|&value| half::f16::from_f32(value).to_bits().to_ne_bytes())
+            .collect()
+    } else {
+        f32_bytes(values).to_vec()
     }
 }
 

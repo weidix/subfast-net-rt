@@ -4,7 +4,7 @@ use subfast_net_rt::model::{Model, ModelType};
 use subfast_net_rt::tensor::Tensor;
 
 const INPUT_SHAPE: [usize; 4] = [1, 3, 32, 256];
-const PAIR_INPUT_SHAPE: [usize; 4] = [1, 3, 64, 256];
+const PAIR_INPUT_SHAPE: [usize; 4] = [1, 3, 32, 256];
 
 pub fn deterministic_input(seed: u32) -> Tensor {
     deterministic_input_for(INPUT_SHAPE, seed)
