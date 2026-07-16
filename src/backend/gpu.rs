@@ -261,10 +261,19 @@ const INPUT_H: u32 = __INPUT_H__u;
 const INPUT_W: u32 = __INPUT_W__u;
 const INPUT_PLANE: u32 = INPUT_H * INPUT_W;
 const INPUT_ELEMENTS: u32 = INPUT_PLANE * 3u;
+const TILE_H: u32 = 8u;
+const TILE_W: u32 = 16u;
+const TILE_COLUMNS: u32 = (INPUT_W + TILE_W - 1u) / TILE_W;
+const SHARED_H: u32 = TILE_H + 4u;
+const SHARED_W: u32 = TILE_W + 4u;
+const SHARED_PIXELS: u32 = SHARED_H * SHARED_W;
 
 @group(0) @binding(0) var<storage, read> left: array<f32>;
 @group(0) @binding(1) var<storage, read> right: array<f32>;
 @group(0) @binding(2) var<storage, read_write> output: array<f32>;
+
+var<workgroup> mean_value: array<f32, SHARED_PIXELS>;
+var<workgroup> delta: array<f32, SHARED_PIXELS>;
 
 fn value_channel(red_input: f32, green_input: f32, blue_input: f32) -> f32 {
     let red = red_input * 0.229 + 0.485;
@@ -279,49 +288,63 @@ fn main(
     @builtin(workgroup_id) workgroup: vec3<u32>,
 ) {
     let sample = workgroup.y;
-    let pixel = workgroup.x * 128u + local;
-    if (pixel >= INPUT_PLANE) {
+    let tile_x = workgroup.x % TILE_COLUMNS;
+    let tile_y = workgroup.x / TILE_COLUMNS;
+    let input_base = sample * INPUT_ELEMENTS;
+
+    for (var shared_index = local; shared_index < SHARED_PIXELS; shared_index += 128u) {
+        let shared_x = shared_index % SHARED_W;
+        let shared_y = shared_index / SHARED_W;
+        let input_x = i32(tile_x * TILE_W + shared_x) - 2;
+        let input_y = i32(tile_y * TILE_H + shared_y) - 2;
+        let valid = input_x >= 0 && input_x < i32(INPUT_W)
+            && input_y >= 0 && input_y < i32(INPUT_H);
+        var left_value = 0.0;
+        var right_value = 0.0;
+        if (valid) {
+            let pixel = u32(input_y) * INPUT_W + u32(input_x);
+            left_value = value_channel(
+                left[input_base + pixel],
+                left[input_base + INPUT_PLANE + pixel],
+                left[input_base + INPUT_PLANE * 2u + pixel],
+            );
+            right_value = value_channel(
+                right[input_base + pixel],
+                right[input_base + INPUT_PLANE + pixel],
+                right[input_base + INPUT_PLANE * 2u + pixel],
+            );
+        }
+        mean_value[shared_index] = 0.5 * (left_value + right_value);
+        delta[shared_index] = left_value - right_value;
+    }
+    workgroupBarrier();
+
+    let local_x = local % TILE_W;
+    let local_y = local / TILE_W;
+    let x = tile_x * TILE_W + local_x;
+    let y = tile_y * TILE_H + local_y;
+    if (x >= INPUT_W || y >= INPUT_H) {
         return;
     }
-    let y = pixel / INPUT_W;
-    let x = pixel % INPUT_W;
-    let input_base = sample * INPUT_ELEMENTS;
+    let pixel = y * INPUT_W + x;
     let output_base = sample * INPUT_ELEMENTS + pixel * 3u;
-    let left_value = value_channel(
-        left[input_base + pixel],
-        left[input_base + INPUT_PLANE + pixel],
-        left[input_base + INPUT_PLANE * 2u + pixel],
-    );
-    let right_value = value_channel(
-        right[input_base + pixel],
-        right[input_base + INPUT_PLANE + pixel],
-        right[input_base + INPUT_PLANE * 2u + pixel],
-    );
-    let delta = left_value - right_value;
+    let center = (local_y + 2u) * SHARED_W + local_x + 2u;
+    let center_delta = delta[center];
     let y0 = select(y - 2u, 0u, y < 2u);
     let y1 = min(y + 3u, INPUT_H);
     let x0 = select(x - 2u, 0u, x < 2u);
     let x1 = min(x + 3u, INPUT_W);
     let count = f32((y1 - y0) * (x1 - x0));
     var background = 0.0;
-    for (var yy = y0; yy < y1; yy += 1u) {
-        for (var xx = x0; xx < x1; xx += 1u) {
-            let neighbor = yy * INPUT_W + xx;
-            background += value_channel(
-                left[input_base + neighbor],
-                left[input_base + INPUT_PLANE + neighbor],
-                left[input_base + INPUT_PLANE * 2u + neighbor],
-            ) - value_channel(
-                right[input_base + neighbor],
-                right[input_base + INPUT_PLANE + neighbor],
-                right[input_base + INPUT_PLANE * 2u + neighbor],
-            );
+    for (var offset_y = 0u; offset_y < 5u; offset_y += 1u) {
+        for (var offset_x = 0u; offset_x < 5u; offset_x += 1u) {
+            background += delta[(local_y + offset_y) * SHARED_W + local_x + offset_x];
         }
     }
     background /= count;
-    output[output_base] = 0.5 * (left_value + right_value);
-    output[output_base + 1u] = abs(delta);
-    output[output_base + 2u] = abs(delta - background);
+    output[output_base] = mean_value[center];
+    output[output_base + 1u] = abs(center_delta);
+    output[output_base + 2u] = abs(center_delta - background);
 }
 "#;
 
@@ -777,7 +800,6 @@ struct ConvParams {
 }
 
 #[derive(Clone, Copy)]
-#[allow(dead_code)]
 struct SeparableParams {
     input_h: usize,
     input_w: usize,
@@ -788,7 +810,6 @@ struct SeparableParams {
     stride_h: usize,
 }
 
-#[allow(dead_code)]
 fn fused_separable_spatial_shader(params: SeparableParams) -> String {
     let output_groups = params.out_channels / 4;
     let accumulators = (0..output_groups)
@@ -903,7 +924,6 @@ fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {{
     )
 }
 
-#[allow(dead_code)]
 fn spatial_dense_conv_shader(params: ConvParams) -> String {
     let output_groups = params.out_channels / 4;
     let groups_per_invocation = output_groups;
@@ -1044,7 +1064,6 @@ fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {{
     )
 }
 
-#[allow(dead_code)]
 fn tiled_dense_conv_shader(params: ConvParams) -> String {
     let accumulators = (0..4)
         .map(|index| format!("    var sum{index} = bias[output_group];"))
@@ -1189,7 +1208,6 @@ fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {{
     )
 }
 
-#[allow(dead_code)]
 fn vector_conv_shader(params: ConvParams) -> String {
     if !params.depthwise {
         return tiled_dense_conv_shader(params);
@@ -1357,6 +1375,47 @@ impl GpuLayer {
             hal::BufferUses::STORAGE_READ_ONLY,
         )?;
 
+        if params.out_channels.is_multiple_of(4) {
+            let spatial_dense = !params.depthwise
+                && params.kernel == [5, 5]
+                && (params.output_h * params.output_w).is_multiple_of(WORKGROUP_SIZE);
+            let tiled_dense = !params.depthwise && params.output_w.is_multiple_of(4);
+            let outputs_per_invocation = if params.depthwise {
+                4
+            } else if spatial_dense {
+                params.out_channels
+            } else {
+                16
+            };
+            let vector_elements = elements / outputs_per_invocation;
+            if (params.depthwise || spatial_dense || tiled_dense)
+                && vector_elements.is_multiple_of(WORKGROUP_SIZE)
+            {
+                let shader_source = if spatial_dense {
+                    spatial_dense_conv_shader(params)
+                } else {
+                    vector_conv_shader(params)
+                };
+                let pipeline = create_pipeline(
+                    &context.device,
+                    "subfast vector ROI convolution",
+                    &shader_source,
+                )?;
+                let bind_group = sequential_bind_group(
+                    &context.device,
+                    &pipeline,
+                    "subfast vector ROI convolution bindings",
+                    &[source, &weight_buffer, &bias_buffer, target],
+                )?;
+                return Ok(Self {
+                    pipeline: Some(pipeline),
+                    bind_group,
+                    workgroups_per_sample: (vector_elements / WORKGROUP_SIZE) as u32,
+                    _resources: vec![weight_buffer, bias_buffer],
+                });
+            }
+        }
+
         let values = [
             params.input_h as u32,
             params.input_w as u32,
@@ -1400,7 +1459,7 @@ impl GpuLayer {
         })
     }
 
-    #[allow(dead_code, clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn new_fused_separable(
         context: &GpuContext,
         source: &hal::Buffer,
@@ -1782,11 +1841,11 @@ impl PairGpu {
                 "subfast pair feature bindings",
                 &[&left_input, &right_input, &features_buffer],
             )?,
-            workgroups_per_sample: (input_h * input_w).div_ceil(128) as u32,
+            workgroups_per_sample: (input_h.div_ceil(8) * input_w.div_ceil(16)) as u32,
             _resources: Vec::new(),
         };
 
-        let layers = vec![
+        let mut layers = vec![
             GpuLayer::new(
                 context,
                 &features_buffer,
@@ -1827,91 +1886,156 @@ impl PairGpu {
                     true,
                 ),
             )?,
-            GpuLayer::new(
-                context,
-                &stage_b,
-                &stage_a,
-                &detail_dw_w,
-                &detail_dw_b,
-                ConvParams::depthwise(down_h, down_w, 32, down_h, down_w, [1, 1]),
-            )?,
-            GpuLayer::new(
-                context,
-                &stage_a,
-                &stage_b,
-                &detail_pw_w,
-                &detail_pw_b,
-                ConvParams::dense(
-                    down_h,
-                    down_w,
-                    32,
-                    down_h,
-                    down_w,
-                    32,
-                    [1, 1],
-                    [1, 1],
-                    [0, 0],
-                    [1, 1],
-                    true,
-                ),
-            )?,
-            GpuLayer::new(
-                context,
-                &stage_b,
-                &stage_a,
-                &vertical_dw_w,
-                &vertical_dw_b,
-                ConvParams::depthwise(down_h, down_w, 32, final_h, final_w, [2, 1]),
-            )?,
-            GpuLayer::new(
-                context,
-                &stage_a,
-                &stage_b,
-                &vertical_pw_w,
-                &vertical_pw_b,
-                ConvParams::dense(
-                    final_h,
-                    final_w,
-                    32,
-                    final_h,
-                    final_w,
-                    48,
-                    [1, 1],
-                    [1, 1],
-                    [0, 0],
-                    [1, 1],
-                    true,
-                ),
-            )?,
-            GpuLayer::new(
-                context,
-                &stage_b,
-                &stage_a,
-                &context_dw_w,
-                &context_dw_b,
-                ConvParams::depthwise(final_h, final_w, 48, final_h, final_w, [1, 1]),
-            )?,
-            GpuLayer::new(
-                context,
-                &stage_a,
-                &stage_b,
-                &context_pw_w,
-                &context_pw_b,
-                ConvParams::dense(
-                    final_h,
-                    final_w,
-                    48,
-                    final_h,
-                    final_w,
-                    48,
-                    [1, 1],
-                    [1, 1],
-                    [0, 0],
-                    [1, 1],
-                    true,
-                ),
-            )?,
         ];
+
+        let fused_separable = (down_h * down_w).is_multiple_of(WORKGROUP_SIZE)
+            && (final_h * final_w).is_multiple_of(WORKGROUP_SIZE)
+            && down_w == final_w;
+        if fused_separable {
+            layers.extend([
+                GpuLayer::new_fused_separable(
+                    context,
+                    &stage_b,
+                    &stage_a,
+                    &detail_dw_w,
+                    &detail_dw_b,
+                    &detail_pw_w,
+                    &detail_pw_b,
+                    SeparableParams {
+                        input_h: down_h,
+                        input_w: down_w,
+                        in_channels: 32,
+                        output_h: down_h,
+                        output_w: down_w,
+                        out_channels: 32,
+                        stride_h: 1,
+                    },
+                )?,
+                GpuLayer::new_fused_separable(
+                    context,
+                    &stage_a,
+                    &stage_b,
+                    &vertical_dw_w,
+                    &vertical_dw_b,
+                    &vertical_pw_w,
+                    &vertical_pw_b,
+                    SeparableParams {
+                        input_h: down_h,
+                        input_w: down_w,
+                        in_channels: 32,
+                        output_h: final_h,
+                        output_w: final_w,
+                        out_channels: 48,
+                        stride_h: 2,
+                    },
+                )?,
+                GpuLayer::new_fused_separable(
+                    context,
+                    &stage_b,
+                    &stage_a,
+                    &context_dw_w,
+                    &context_dw_b,
+                    &context_pw_w,
+                    &context_pw_b,
+                    SeparableParams {
+                        input_h: final_h,
+                        input_w: final_w,
+                        in_channels: 48,
+                        output_h: final_h,
+                        output_w: final_w,
+                        out_channels: 48,
+                        stride_h: 1,
+                    },
+                )?,
+            ]);
+        } else {
+            layers.extend([
+                GpuLayer::new(
+                    context,
+                    &stage_b,
+                    &stage_a,
+                    &detail_dw_w,
+                    &detail_dw_b,
+                    ConvParams::depthwise(down_h, down_w, 32, down_h, down_w, [1, 1]),
+                )?,
+                GpuLayer::new(
+                    context,
+                    &stage_a,
+                    &stage_b,
+                    &detail_pw_w,
+                    &detail_pw_b,
+                    ConvParams::dense(
+                        down_h,
+                        down_w,
+                        32,
+                        down_h,
+                        down_w,
+                        32,
+                        [1, 1],
+                        [1, 1],
+                        [0, 0],
+                        [1, 1],
+                        true,
+                    ),
+                )?,
+                GpuLayer::new(
+                    context,
+                    &stage_b,
+                    &stage_a,
+                    &vertical_dw_w,
+                    &vertical_dw_b,
+                    ConvParams::depthwise(down_h, down_w, 32, final_h, final_w, [2, 1]),
+                )?,
+                GpuLayer::new(
+                    context,
+                    &stage_a,
+                    &stage_b,
+                    &vertical_pw_w,
+                    &vertical_pw_b,
+                    ConvParams::dense(
+                        final_h,
+                        final_w,
+                        32,
+                        final_h,
+                        final_w,
+                        48,
+                        [1, 1],
+                        [1, 1],
+                        [0, 0],
+                        [1, 1],
+                        true,
+                    ),
+                )?,
+                GpuLayer::new(
+                    context,
+                    &stage_b,
+                    &stage_a,
+                    &context_dw_w,
+                    &context_dw_b,
+                    ConvParams::depthwise(final_h, final_w, 48, final_h, final_w, [1, 1]),
+                )?,
+                GpuLayer::new(
+                    context,
+                    &stage_a,
+                    &stage_b,
+                    &context_pw_w,
+                    &context_pw_b,
+                    ConvParams::dense(
+                        final_h,
+                        final_w,
+                        48,
+                        final_h,
+                        final_w,
+                        48,
+                        [1, 1],
+                        [1, 1],
+                        [0, 0],
+                        [1, 1],
+                        true,
+                    ),
+                )?,
+            ]);
+        }
 
         let mask_weight = context.device.create_buffer_init(
             "subfast pair mask weight",
@@ -1948,6 +2072,7 @@ impl PairGpu {
             "subfast pair tail",
             &pair_tail_shader(final_h, final_w),
         )?;
+        let tail_features = if fused_separable { &stage_a } else { &stage_b };
         let tail = GpuKernel {
             pipeline: tail_pipeline.clone(),
             bind_group: sequential_bind_group(
@@ -1955,7 +2080,7 @@ impl PairGpu {
                 &tail_pipeline,
                 "subfast pair tail bindings",
                 &[
-                    &stage_b,
+                    tail_features,
                     &mask_weight,
                     &classifier1_weight,
                     &classifier1_bias,
