@@ -12,6 +12,8 @@ use serde::Serialize;
 
 use crate::error::{Result, RtError};
 use crate::ir::tensor::DType;
+use crate::model::preprocess::Normalization;
+use crate::model::{Model, ModelType};
 use crate::tensor::Tensor;
 
 const IMAGENET_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
@@ -22,6 +24,24 @@ pub enum ResizeMode {
     Stretch,
     LetterboxTopLeft,
     LetterboxCentered,
+}
+
+/// Resampling kernel used when the source geometry has to change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizeFilter {
+    /// Fixed-size bilinear kernel, matching `align_corners=false` interpolation.
+    Interpolation,
+    /// Antialiased bilinear convolution, matching PIL `Image.resize(BILINEAR)`.
+    Convolution,
+}
+
+impl ResizeFilter {
+    fn resize_alg(self) -> ResizeAlg {
+        match self {
+            Self::Interpolation => ResizeAlg::Interpolation(FirFilterType::Bilinear),
+            Self::Convolution => ResizeAlg::Convolution(FirFilterType::Bilinear),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +64,7 @@ pub struct ImagePreprocessor {
     target_width: u32,
     target_height: u32,
     mode: ResizeMode,
+    resize_alg: ResizeAlg,
     resizer: Resizer,
     resized: FirImage<'static>,
     normalize_lut: [[u32; 256]; 3],
@@ -55,30 +76,38 @@ impl std::fmt::Debug for ImagePreprocessor {
             .debug_struct("ImagePreprocessor")
             .field("shape", &self.shape)
             .field("mode", &self.mode)
+            .field("resize_alg", &self.resize_alg)
             .finish_non_exhaustive()
     }
 }
 
 impl ImagePreprocessor {
+    /// Legacy ROI preprocessing: ImageNet normalization and bilinear interpolation.
     pub fn new(input_shape: &[usize], mode: ResizeMode) -> Result<Self> {
+        Self::with_options(
+            input_shape,
+            mode,
+            Normalization::Imagenet,
+            ResizeFilter::Interpolation,
+        )
+    }
+
+    pub fn with_options(
+        input_shape: &[usize],
+        mode: ResizeMode,
+        normalization: Normalization,
+        filter: ResizeFilter,
+    ) -> Result<Self> {
         let (target_width, target_height) = validate_input_shape(input_shape)?;
-        let mut normalize_lut = [[0u32; 256]; 3];
-        for (channel, channel_lut) in normalize_lut.iter_mut().enumerate() {
-            for (value, normalized) in channel_lut.iter_mut().enumerate() {
-                *normalized = (((value as f32 / 255.0) - IMAGENET_MEAN[channel])
-                    / IMAGENET_STD[channel])
-                    .to_bits()
-                    .to_le();
-            }
-        }
         Ok(Self {
             shape: input_shape.to_vec(),
             target_width,
             target_height,
             mode,
+            resize_alg: filter.resize_alg(),
             resizer: Resizer::new(),
             resized: FirImage::new(target_width, target_height, PixelType::U8x3),
-            normalize_lut,
+            normalize_lut: normalize_lut(normalization),
         })
     }
 
@@ -151,8 +180,7 @@ impl ImagePreprocessor {
 
         let source = FirImageRef::new(width, height, rgb, PixelType::U8x3)
             .map_err(|error| invalid_preprocess(format!("invalid RGB image: {error}")))?;
-        let options =
-            ResizeOptions::new().resize_alg(ResizeAlg::Interpolation(FirFilterType::Bilinear));
+        let options = ResizeOptions::new().resize_alg(self.resize_alg);
         self.resizer
             .resize(&source, &mut self.resized, &options)
             .map_err(|error| invalid_preprocess(format!("SIMD resize failed: {error}")))?;
@@ -191,6 +219,48 @@ impl ImagePreprocessor {
     fn output_byte_len(&self) -> usize {
         3 * self.target_width as usize * self.target_height as usize * size_of::<f32>()
     }
+}
+
+/// Build the preprocessor described by a loaded model bundle.
+///
+/// Bundles that export a preprocessing contract use its resize mode and
+/// normalization. Frame presence models resize with the antialiased PIL
+/// bilinear kernel; ROI models keep the fixed-kernel bilinear used by their
+/// `align_corners=false` reference pipeline. Bundles without a contract fall
+/// back to the legacy ROI geometry and ImageNet normalization.
+pub fn preprocessor_for_model(model: &Model) -> Result<ImagePreprocessor> {
+    let inputs = model.input_info();
+    let input_shape = &inputs
+        .first()
+        .ok_or_else(|| invalid_preprocess("model declares no inputs"))?
+        .shape;
+    if let Some(contract) = model.preprocessing {
+        let filter = match model.model_type {
+            ModelType::FramePresence => ResizeFilter::Convolution,
+            ModelType::RoiPresence | ModelType::RoiPairMatcher => ResizeFilter::Interpolation,
+        };
+        return ImagePreprocessor::with_options(
+            input_shape,
+            contract.resize_mode,
+            contract.normalization,
+            filter,
+        );
+    }
+    let mode = match inputs.len() {
+        1 => ResizeMode::LetterboxCentered,
+        2 => ResizeMode::Stretch,
+        count => {
+            return Err(invalid_preprocess(format!(
+                "unsupported model input count {count}"
+            )));
+        }
+    };
+    ImagePreprocessor::with_options(
+        input_shape,
+        mode,
+        Normalization::Imagenet,
+        ResizeFilter::Interpolation,
+    )
 }
 
 #[derive(Debug)]
@@ -377,6 +447,30 @@ fn preprocess_dynamic_image_mode(
             preprocessor.preprocess_rgb(rgb.as_raw(), rgb.width(), rgb.height())
         }
     }
+}
+
+fn normalize_lut(normalization: Normalization) -> [[u32; 256]; 3] {
+    let mut lut = [[0u32; 256]; 3];
+    match normalization {
+        Normalization::Imagenet => {
+            for (channel, channel_lut) in lut.iter_mut().enumerate() {
+                for (value, normalized) in channel_lut.iter_mut().enumerate() {
+                    *normalized = (((value as f32 / 255.0) - IMAGENET_MEAN[channel])
+                        / IMAGENET_STD[channel])
+                        .to_bits()
+                        .to_le();
+                }
+            }
+        }
+        Normalization::Scale(scale) => {
+            for channel_lut in &mut lut {
+                for (value, normalized) in channel_lut.iter_mut().enumerate() {
+                    *normalized = (value as f32 * scale).to_bits().to_le();
+                }
+            }
+        }
+    }
+    lut
 }
 
 fn validate_input_shape(input_shape: &[usize]) -> Result<(u32, u32)> {

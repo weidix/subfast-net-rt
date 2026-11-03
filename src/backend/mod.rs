@@ -3,6 +3,7 @@ use crate::model::Model;
 use crate::tensor::Tensor;
 
 pub mod cpu;
+pub mod frame_presence;
 #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
 pub mod gpu;
 #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]

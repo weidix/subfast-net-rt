@@ -40,6 +40,7 @@ struct Shared {
     _instance: RawInstance,
     limits: wgt::Limits,
     features: wgt::Features,
+    discrete: bool,
 }
 
 #[derive(Clone)]
@@ -99,6 +100,7 @@ impl Device {
                     _instance: instance,
                     limits,
                     features,
+                    discrete: exposed.info.device_type == wgt::DeviceType::DiscreteGpu,
                 }),
             },
             AdapterInfo { name },
@@ -111,6 +113,10 @@ impl Device {
 
     pub(crate) fn supports_f16(&self) -> bool {
         self.shared.features.contains(wgt::Features::SHADER_F16)
+    }
+
+    pub(crate) fn stages_input_upload(&self) -> bool {
+        cfg!(not(target_os = "macos")) && self.shared.discrete
     }
 
     pub(crate) fn create_buffer(
@@ -777,6 +783,7 @@ pub(crate) struct Runner {
     encoder: Option<RawCommandEncoder>,
     pending_command: Option<RawCommandBuffer>,
     in_flight_groups: Vec<BindGroup>,
+    in_flight_upload: Option<[Buffer; 2]>,
     next_fence_value: hal::FenceValue,
     recording: bool,
     poisoned: bool,
@@ -801,6 +808,7 @@ impl Runner {
             encoder: Some(encoder),
             pending_command: None,
             in_flight_groups: Vec::new(),
+            in_flight_upload: None,
             next_fence_value: 1,
             recording: false,
             poisoned: false,
@@ -809,11 +817,54 @@ impl Runner {
     }
 
     pub(crate) fn begin(&mut self, label: &'static str) -> Result<()> {
-        if self.poisoned {
-            return Err(RtError::Inference(
-                "GPU runner is unavailable after an earlier HAL failure".into(),
-            ));
+        self.begin_recording(label, None)
+    }
+
+    /// Upload through a mapped staging buffer when GPU storage is device-local.
+    /// On unified memory the storage itself can be mapped.
+    pub(crate) fn begin_with_input(
+        &mut self,
+        label: &'static str,
+        storage: &Buffer,
+        staging: Option<&Buffer>,
+        data: &[u8],
+    ) -> Result<()> {
+        self.ensure_available()?;
+        let upload = if let Some(staging) = staging {
+            let size = wgt::BufferSize::new(data.len() as u64)
+                .ok_or_else(|| RtError::Inference("GPU input upload must not be empty".into()))?;
+            if size.get() > storage.size()
+                || !size.get().is_multiple_of(wgt::COPY_BUFFER_ALIGNMENT)
+                || !staging.0.usage.contains(BufferUses::COPY_SRC)
+                || !storage.0.usage.contains(BufferUses::COPY_DST)
+                || Arc::ptr_eq(&storage.0, &staging.0)
+                || !Arc::ptr_eq(&self.shared, &storage.0.shared)
+                || !Arc::ptr_eq(&self.shared, &staging.0.shared)
+            {
+                return Err(RtError::Inference("invalid GPU staged input upload".into()));
+            }
+            staging.write(data)?;
+            Some((staging, storage, size))
+        } else {
+            storage.write(data)?;
+            None
+        };
+        self.begin_recording(label, upload)
+    }
+
+    fn ensure_available(&self) -> Result<()> {
+        if self.poisoned || self.recording {
+            return Err(RtError::Inference("GPU runner is unavailable".into()));
         }
+        Ok(())
+    }
+
+    fn begin_recording(
+        &mut self,
+        label: &'static str,
+        upload: Option<(&Buffer, &Buffer, wgt::BufferSize)>,
+    ) -> Result<()> {
+        self.ensure_available()?;
         if self.next_fence_value.checked_add(1).is_none() {
             self.poisoned = true;
             return Err(RtError::Inference("GPU fence value overflow".into()));
@@ -825,6 +876,44 @@ impl Runner {
             return Err(RtError::Inference(format!(
                 "failed to begin GPU encoding: {error}"
             )));
+        }
+        if let Some((source, destination, size)) = upload {
+            // SAFETY: both buffers belong to this device, include the required
+            // copy uses, and cover the initialized, aligned range. The runner
+            // retains them until the submission has completed.
+            unsafe {
+                encoder.transition_buffers(
+                    [
+                        hal::BufferBarrier {
+                            buffer: source.raw(),
+                            usage: hal::StateTransition {
+                                from: source.state(),
+                                to: BufferUses::COPY_SRC,
+                            },
+                        },
+                        hal::BufferBarrier {
+                            buffer: destination.raw(),
+                            usage: hal::StateTransition {
+                                from: destination.state(),
+                                to: BufferUses::COPY_DST,
+                            },
+                        },
+                    ]
+                    .into_iter(),
+                );
+                encoder.copy_buffer_to_buffer(
+                    source.raw(),
+                    destination.raw(),
+                    std::iter::once(hal::BufferCopy {
+                        src_offset: 0,
+                        dst_offset: 0,
+                        size,
+                    }),
+                );
+            }
+            source.set_state(BufferUses::COPY_SRC);
+            destination.set_state(BufferUses::COPY_DST);
+            self.in_flight_upload = Some([source.clone(), destination.clone()]);
         }
         let descriptor = hal::ComputePassDescriptor {
             label: Some(label),
@@ -884,6 +973,7 @@ impl Runner {
             Err(error) => {
                 self.poisoned = true;
                 self.in_flight_groups.clear();
+                self.in_flight_upload = None;
                 return Err(RtError::Inference(format!(
                     "failed to finish GPU encoding: {error}"
                 )));
@@ -902,6 +992,7 @@ impl Runner {
             unsafe { encoder.reset_all(std::iter::once(command)) };
             self.poisoned = true;
             self.in_flight_groups.clear();
+            self.in_flight_upload = None;
             return Err(RtError::Inference(format!(
                 "GPU submission failed: {error}"
             )));
@@ -917,6 +1008,7 @@ impl Runner {
         let command = self.pending_command.take().expect("submitted HAL command");
         unsafe { encoder.reset_all(std::iter::once(command)) };
         self.in_flight_groups.clear();
+        self.in_flight_upload = None;
         Ok(())
     }
 }
@@ -930,6 +1022,7 @@ impl Drop for Runner {
                 std::mem::forget(command);
             }
             std::mem::forget(std::mem::take(&mut self.in_flight_groups));
+            std::mem::forget(self.in_flight_upload.take());
             if let Some(fence) = self.fence.take() {
                 std::mem::forget(fence);
             }

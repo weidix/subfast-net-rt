@@ -70,14 +70,7 @@ fn run() -> subfast_net_rt::Result<()> {
 
     println!("backend: pure-rust-cpu");
     println!("kernel: {}", executable.kernel_name());
-    println!(
-        "model: {}",
-        if batch_one.samples[0].len() == 1 {
-            "presence"
-        } else {
-            "pair_matcher"
-        }
-    );
+    println!("model: {}", model_label(&model));
     println!("model_path: {}", args.model_path.display());
     println!("inputs: {}", batch_one.samples[0].len());
     println!("batch_parallelism: {}", executable.batch_parallelism());
@@ -308,6 +301,14 @@ fn pack_inputs(model: &Model, samples: &[Vec<Tensor>]) -> subfast_net_rt::Result
             Tensor::new(info.dtype, shape, data)
         })
         .collect()
+}
+
+fn model_label(model: &Model) -> &'static str {
+    match model.model_type {
+        subfast_net_rt::model::ModelType::RoiPresence => "presence",
+        subfast_net_rt::model::ModelType::RoiPairMatcher => "pair_matcher",
+        subfast_net_rt::model::ModelType::FramePresence => "frame_presence",
+    }
 }
 
 fn format_batch_sizes(batch_sizes: &[usize]) -> String {

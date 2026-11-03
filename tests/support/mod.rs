@@ -195,6 +195,8 @@ impl ModelBuilder {
             inputs,
             outputs: vec![output],
             weights: WeightStore::from_bytes(self.weights),
+            preprocessing: None,
+            decision_threshold: None,
         }
     }
 }

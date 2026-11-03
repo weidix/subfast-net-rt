@@ -5,6 +5,7 @@
 //! NHWC storage. This keeps the public format portable without ever assuming
 //! that a `Vec<u8>` is aligned for `f32` or SIMD loads.
 
+use crate::backend::frame_presence::FramePresenceCpu;
 use crate::backend::{Backend, Executable};
 use crate::error::{Result, RtError};
 use crate::ir::tensor::{DType, TensorInfo, TensorKind};
@@ -23,22 +24,36 @@ pub struct CpuExecutable {
 enum CompiledRoiModel {
     Presence(Box<PresenceModel>),
     Pair(Box<PairModel>),
+    FramePresence(Box<FramePresenceCpu>),
 }
 
 impl CompiledRoiModel {
     fn compile(model: &Model, inner_parallelism: bool) -> Result<Self> {
-        match model.inputs.len() {
-            1 => Ok(Self::Presence(Box::new(PresenceModel::compile(
-                model,
-                inner_parallelism,
-            )?))),
-            2 => Ok(Self::Pair(Box::new(PairModel::compile(
-                model,
-                inner_parallelism,
-            )?))),
-            count => Err(RtError::Inference(format!(
-                "CPU ROI backend expects one or two inputs, got {count}"
-            ))),
+        match model.model_type {
+            ModelType::FramePresence => {
+                if model.inputs.len() != 1 {
+                    return Err(RtError::Inference(format!(
+                        "CPU frame-presence backend expects one input, got {}",
+                        model.inputs.len()
+                    )));
+                }
+                Ok(Self::FramePresence(Box::new(FramePresenceCpu::compile(
+                    model,
+                )?)))
+            }
+            ModelType::RoiPresence | ModelType::RoiPairMatcher => match model.inputs.len() {
+                1 => Ok(Self::Presence(Box::new(PresenceModel::compile(
+                    model,
+                    inner_parallelism,
+                )?))),
+                2 => Ok(Self::Pair(Box::new(PairModel::compile(
+                    model,
+                    inner_parallelism,
+                )?))),
+                count => Err(RtError::Inference(format!(
+                    "CPU ROI backend expects one or two inputs, got {count}"
+                ))),
+            },
         }
     }
 
@@ -55,6 +70,7 @@ impl CompiledRoiModel {
             Self::Pair(model) => {
                 model.run_bytes(&inputs[0].data[start..end], &inputs[1].data[start..end])
             }
+            Self::FramePresence(model) => model.run_nchw_bytes(&inputs[0].data[start..end]),
         }
     }
 
@@ -62,6 +78,7 @@ impl CompiledRoiModel {
         match self {
             Self::Presence(model) => Self::Presence(Box::new(model.worker_clone())),
             Self::Pair(model) => Self::Pair(Box::new(model.worker_clone())),
+            Self::FramePresence(model) => Self::FramePresence(Box::new(model.worker_clone())),
         }
     }
 }
@@ -99,6 +116,7 @@ impl CpuExecutable {
         match &mut self.model {
             CompiledRoiModel::Presence(model) => model.run_bytes(&inputs[0].data),
             CompiledRoiModel::Pair(model) => model.run_bytes(&inputs[0].data, &inputs[1].data),
+            CompiledRoiModel::FramePresence(model) => model.run_nchw_bytes(&inputs[0].data),
         }
     }
 
@@ -141,6 +159,7 @@ impl CpuExecutable {
         // Presence already occupies four SIMD lanes per sample; a larger gate
         // avoids losing throughput to heterogeneous-core scheduling on small batches.
         let parallel_threshold = match &self.model {
+            CompiledRoiModel::FramePresence(_) => 2,
             #[cfg(target_arch = "aarch64")]
             CompiledRoiModel::Presence(_) => scalar_parallelism() * 4,
             _ => scalar_parallelism() * 2,
@@ -178,6 +197,7 @@ impl CpuExecutable {
         match &self.model {
             CompiledRoiModel::Presence(model) => model.kernel.name(),
             CompiledRoiModel::Pair(model) => model.kernel.name(),
+            CompiledRoiModel::FramePresence(model) => model.kernel_name(),
         }
     }
 }
@@ -189,7 +209,7 @@ impl Executable for CpuExecutable {
     }
 }
 
-fn validate_model_io(model: &Model) -> Result<()> {
+pub(crate) fn validate_model_io(model: &Model) -> Result<()> {
     if model.outputs.len() != 1 {
         return Err(RtError::Inference(format!(
             "CPU ROI backend expects one output, got {}",

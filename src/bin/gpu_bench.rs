@@ -7,7 +7,7 @@ use subfast_net_rt::backend::Backend;
 use subfast_net_rt::backend::cpu::CpuBackend;
 use subfast_net_rt::backend::gpu::GpuBackend;
 use subfast_net_rt::ir::tensor::DType;
-use subfast_net_rt::model::Model;
+use subfast_net_rt::model::{Model, ModelType};
 use subfast_net_rt::tensor::Tensor;
 
 #[derive(Debug, Parser)]
@@ -23,6 +23,12 @@ struct Args {
     batch_sizes: Vec<usize>,
     #[arg(long, default_value_t = 6)]
     rounds: usize,
+    /// Measure each backend in its own warmed phase.
+    #[arg(long)]
+    separate: bool,
+    /// Validate against CPU once, then warm up and time only the GPU.
+    #[arg(long, conflicts_with = "separate")]
+    gpu_only: bool,
 }
 
 #[derive(Default)]
@@ -60,10 +66,10 @@ fn run() -> subfast_net_rt::Result<()> {
     println!("adapter: {}", gpu.adapter_name());
     println!(
         "model: {}",
-        if model.inputs.len() == 1 {
-            "presence"
-        } else {
-            "pair_matcher"
+        match model.model_type {
+            ModelType::RoiPresence => "presence",
+            ModelType::RoiPairMatcher => "pair_matcher",
+            ModelType::FramePresence => "frame_presence",
         }
     );
     println!("cpu_kernel: {}", cpu.kernel_name());
@@ -77,9 +83,23 @@ fn run() -> subfast_net_rt::Result<()> {
         verify(&cpu_output, &gpu_output)?;
 
         let warmup_calls = args.warmup.div_ceil(batch_size);
-        for _ in 0..warmup_calls {
-            cpu.run_batch_scalar_into(black_box(&inputs), &mut cpu_output)?;
-            gpu.run_batch_scalar_into(black_box(&inputs), &mut gpu_output)?;
+        if args.gpu_only {
+            time_gpu(&mut gpu, &inputs, &mut gpu_output, warmup_calls)?;
+            let calls = args.iterations.div_ceil(batch_size);
+            let elapsed = time_gpu(&mut gpu, &inputs, &mut gpu_output, calls)?;
+            let samples = calls * batch_size;
+            let gpu_ms = elapsed.as_secs_f64() * 1_000.0 / calls as f64;
+            let gpu_rate = samples as f64 / elapsed.as_secs_f64();
+            println!(
+                "batch={batch_size} samples={samples} gpu_ms={gpu_ms:.4} gpu_samples_per_second={gpu_rate:.0}"
+            );
+            continue;
+        }
+        if !args.separate {
+            for _ in 0..warmup_calls {
+                cpu.run_batch_scalar_into(black_box(&inputs), &mut cpu_output)?;
+                gpu.run_batch_scalar_into(black_box(&inputs), &mut gpu_output)?;
+            }
         }
 
         let totals = measure(
@@ -90,6 +110,7 @@ fn run() -> subfast_net_rt::Result<()> {
             &mut gpu_output,
             args.iterations,
             args.rounds,
+            args.separate.then_some(warmup_calls),
         )?;
         let samples = totals.calls * batch_size;
         let cpu_rate = samples as f64 / totals.cpu.as_secs_f64();
@@ -113,6 +134,7 @@ fn measure(
     gpu_output: &mut [f32],
     target_samples: usize,
     rounds: usize,
+    separate_warmup: Option<usize>,
 ) -> subfast_net_rt::Result<Totals> {
     let batch_size = cpu_output.len();
     let calls = target_samples.div_ceil(batch_size);
@@ -120,6 +142,13 @@ fn measure(
         calls,
         ..Totals::default()
     };
+    if let Some(warmup) = separate_warmup {
+        time_cpu(cpu, inputs, cpu_output, warmup)?;
+        totals.cpu = time_cpu(cpu, inputs, cpu_output, calls)?;
+        time_gpu(gpu, inputs, gpu_output, warmup)?;
+        totals.gpu = time_gpu(gpu, inputs, gpu_output, calls)?;
+        return Ok(totals);
+    }
     for round in 0..rounds {
         let round_calls = calls / rounds + usize::from(round < calls % rounds);
         if round.is_multiple_of(2) {

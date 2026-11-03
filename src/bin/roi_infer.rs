@@ -5,12 +5,13 @@ use serde::Serialize;
 use subfast_net_rt::backend::Backend;
 use subfast_net_rt::backend::Executable;
 use subfast_net_rt::backend::cpu::CpuBackend;
-use subfast_net_rt::image_infer::{
-    preprocess_centered_letterbox_image_path, preprocess_stretched_image_path,
-};
+use subfast_net_rt::image_infer::{ImagePreprocessor, preprocessor_for_model};
+use subfast_net_rt::model::ModelType;
+
+const DEFAULT_DECISION_THRESHOLD: f32 = 0.5;
 
 #[derive(Debug, Parser)]
-#[command(about = "Run ROI presence or pair-matcher inference")]
+#[command(about = "Run ROI presence, pair-matcher, or frame-presence inference")]
 struct Args {
     #[arg(long)]
     model_path: PathBuf,
@@ -31,6 +32,9 @@ enum BackendKind {
 struct LoadedModel {
     executable: Box<dyn Executable>,
     input_shapes: Vec<Vec<usize>>,
+    preprocessor: ImagePreprocessor,
+    label: &'static str,
+    decision_threshold: f32,
 }
 
 impl LoadedModel {
@@ -42,6 +46,15 @@ impl LoadedModel {
             .iter()
             .map(|info| info.shape.clone())
             .collect();
+        let preprocessor = preprocessor_for_model(&model)?;
+        let label = match model.model_type {
+            ModelType::RoiPresence => "presence",
+            ModelType::RoiPairMatcher => "pair_matcher",
+            ModelType::FramePresence => "frame_presence",
+        };
+        let decision_threshold = model
+            .decision_threshold
+            .unwrap_or(DEFAULT_DECISION_THRESHOLD);
         let executable: Box<dyn Executable> = match backend {
             BackendKind::Cpu => Box::new(CpuBackend.compile(&model)?),
             BackendKind::Gpu => compile_gpu(&model)?,
@@ -49,11 +62,26 @@ impl LoadedModel {
         Ok(Self {
             executable,
             input_shapes,
+            preprocessor,
+            label,
+            decision_threshold,
         })
     }
 
     fn input_shapes(&self) -> Vec<Vec<usize>> {
         self.input_shapes.clone()
+    }
+
+    fn preprocess(
+        &mut self,
+        rgb: &[u8],
+        width: u32,
+        height: u32,
+    ) -> subfast_net_rt::Result<subfast_net_rt::tensor::Tensor> {
+        let mut tensor = self.preprocessor.new_output_tensor();
+        self.preprocessor
+            .preprocess_rgb_into(rgb, width, height, &mut tensor)?;
+        Ok(tensor)
     }
 
     fn run(
@@ -114,6 +142,8 @@ struct ResultRecord<'a> {
     inputs: Vec<String>,
     logit: f32,
     probability: f32,
+    decision_threshold: f32,
+    prediction: bool,
 }
 
 fn main() {
@@ -150,13 +180,15 @@ fn run() -> subfast_net_rt::Result<()> {
     };
     let inputs = image_paths
         .iter()
-        .zip(&input_shapes)
-        .map(|(path, shape)| {
-            if input_shapes.len() == 1 {
-                preprocess_centered_letterbox_image_path(path, shape)
-            } else {
-                preprocess_stretched_image_path(path, shape)
-            }
+        .map(|path| {
+            let image = image::open(path).map_err(|source| {
+                subfast_net_rt::RtError::Inference(format!(
+                    "failed to decode image {}: {source}",
+                    path.display()
+                ))
+            })?;
+            let rgb = image.to_rgb8();
+            model.preprocess(rgb.as_raw(), rgb.width(), rgb.height())
         })
         .collect::<subfast_net_rt::Result<Vec<_>>>()?;
     let output = model.run(&inputs)?;
@@ -168,18 +200,17 @@ fn run() -> subfast_net_rt::Result<()> {
         )));
     }
     let logit = values[0];
+    let probability = 1.0 / (1.0 + (-logit).exp());
     let record = ResultRecord {
-        model: if input_shapes.len() == 1 {
-            "presence"
-        } else {
-            "pair_matcher"
-        },
+        model: model.label,
         inputs: image_paths
             .iter()
             .map(|path| path.to_string_lossy().into_owned())
             .collect(),
         logit,
-        probability: 1.0 / (1.0 + (-logit).exp()),
+        probability,
+        decision_threshold: model.decision_threshold,
+        prediction: probability >= model.decision_threshold,
     };
     println!(
         "{}",

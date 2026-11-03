@@ -4,17 +4,22 @@ use std::path::Path;
 use safetensors::{Dtype as SafeDtype, SafeTensors};
 
 use crate::error::{Result, RtError};
+use crate::image_infer::ResizeMode;
 use crate::ir::tensor::{DType, Layout, TensorId, TensorInfo, TensorKind, WeightRef};
-use crate::model::schema::ModelConfig;
+use crate::model::preprocess::{INPUT_ALIGNMENT, Normalization, PreprocessContract};
+use crate::model::schema::{ModelConfig, PreprocessingSection};
 use crate::model::weights::WeightStore;
 
 const FORMAT: &str = "subfast-net.safetensors";
 const FORMAT_VERSION: u64 = 1;
+const IMAGENET_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
+const IMAGENET_STD: [f32; 3] = [0.229, 0.224, 0.225];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelType {
     RoiPresence,
     RoiPairMatcher,
+    FramePresence,
 }
 
 impl ModelType {
@@ -22,6 +27,7 @@ impl ModelType {
         match value {
             "roi_presence" => Ok(Self::RoiPresence),
             "roi_pair_matcher" => Ok(Self::RoiPairMatcher),
+            "frame_presence" => Ok(Self::FramePresence),
             other => Err(RtError::Inference(format!(
                 "unsupported safetensors model type {other}"
             ))),
@@ -36,6 +42,10 @@ pub struct Model {
     pub inputs: Vec<TensorId>,
     pub outputs: Vec<TensorId>,
     pub weights: WeightStore,
+    /// Exported preprocessing contract; `None` when the bundle carries none.
+    pub preprocessing: Option<PreprocessContract>,
+    /// Exported decision threshold on the sigmoid score.
+    pub decision_threshold: Option<f32>,
 }
 
 impl Model {
@@ -71,11 +81,15 @@ impl Model {
         let raw = collect_tensors(&file)?;
 
         let mut builder = ModelBuilder::default();
-        let inputs = match model_type {
-            ModelType::RoiPresence => validate_io(&config, &["images"], "presence_logit")?
-                .into_iter()
-                .map(|(name, shape)| builder.add_io(&name, TensorKind::UserInput, shape.to_vec()))
-                .collect(),
+        let inputs: Vec<TensorId> = match model_type {
+            ModelType::RoiPresence | ModelType::FramePresence => {
+                validate_io(&config, &["images"], "presence_logit")?
+                    .into_iter()
+                    .map(|(name, shape)| {
+                        builder.add_io(&name, TensorKind::UserInput, shape.to_vec())
+                    })
+                    .collect()
+            }
             ModelType::RoiPairMatcher => {
                 let inputs = validate_io(&config, &["left", "right"], "same_subtitle_logit")?;
                 if inputs[0].1 != inputs[1].1 {
@@ -92,14 +106,17 @@ impl Model {
             }
         };
         let output_name = match model_type {
-            ModelType::RoiPresence => "presence_logit",
+            ModelType::RoiPresence | ModelType::FramePresence => "presence_logit",
             ModelType::RoiPairMatcher => "same_subtitle_logit",
         };
         let output = builder.add_io(output_name, TensorKind::UserOutput, vec![1]);
+        let input_shape = builder.tensors[inputs[0].0].shape.clone();
+        let preprocessing = parse_preprocessing(&config, model_type, &input_shape)?;
 
         match model_type {
             ModelType::RoiPresence => load_presence_weights(&raw, &mut builder)?,
             ModelType::RoiPairMatcher => load_pair_weights(&raw, &mut builder)?,
+            ModelType::FramePresence => load_frame_presence_weights(&raw, &mut builder)?,
         }
         Ok(Self {
             model_type,
@@ -107,6 +124,11 @@ impl Model {
             inputs,
             outputs: vec![output],
             weights: WeightStore::from_bytes(builder.weights),
+            preprocessing,
+            decision_threshold: config
+                .postprocessing
+                .as_ref()
+                .and_then(|postprocessing| postprocessing.decision_threshold),
         })
     }
 
@@ -141,6 +163,7 @@ fn validate_config(config: &ModelConfig) -> Result<()> {
         "roi_pair_matcher"
             if config.model.architecture_version == 2
                 && config.model.pooling_version == Some(2) => {}
+        "frame_presence" if config.model.architecture_version == 8 => {}
         _ => {
             return Err(RtError::Json(format!(
                 "unsupported {} architecture/pooling version",
@@ -149,6 +172,109 @@ fn validate_config(config: &ModelConfig) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Resolve the exported preprocessing contract into the runtime representation.
+///
+/// Legacy ROI bundles describe a fixed target through `{width, height}` while
+/// frame-presence bundles use `[width, height]` and a plain value scale.
+fn parse_preprocessing(
+    config: &ModelConfig,
+    model_type: ModelType,
+    input_shape: &[usize],
+) -> Result<Option<PreprocessContract>> {
+    if model_type == ModelType::FramePresence
+        && !input_shape[2..]
+            .iter()
+            .all(|dimension| dimension % INPUT_ALIGNMENT == 0)
+    {
+        return Err(RtError::Json(format!(
+            "frame_presence input dimensions must be multiples of {INPUT_ALIGNMENT}, got {:?}",
+            &input_shape[2..]
+        )));
+    }
+    let Some(section) = config.preprocessing.as_ref() else {
+        if model_type == ModelType::FramePresence {
+            return Err(RtError::Json(
+                "frame_presence bundle must describe its preprocessing contract".into(),
+            ));
+        }
+        return Ok(None);
+    };
+    let resize_mode = parse_resize_mode(section, model_type)?;
+    let target = section
+        .resize
+        .as_ref()
+        .and_then(|resize| resize.target_size.as_ref());
+    if let Some(target) = target {
+        let (width, height) = target
+            .width_height()
+            .ok_or_else(|| RtError::Json("resize target_size must be [width, height]".into()))?;
+        if width != input_shape[3] || height != input_shape[2] {
+            return Err(RtError::Json(format!(
+                "resize target_size [{width}, {height}] does not match input [{}, {}]",
+                input_shape[3], input_shape[2]
+            )));
+        }
+    }
+    let normalization = parse_normalization(section, model_type)?;
+    Ok(Some(PreprocessContract {
+        resize_mode,
+        normalization,
+    }))
+}
+
+fn parse_resize_mode(section: &PreprocessingSection, model_type: ModelType) -> Result<ResizeMode> {
+    let mode = section
+        .resize
+        .as_ref()
+        .map(|resize| resize.mode.as_str())
+        .unwrap_or("stretch");
+    match (mode, model_type) {
+        ("proportional_resize_to_fit", ModelType::FramePresence) => {
+            Ok(ResizeMode::LetterboxCentered)
+        }
+        ("letterbox", _) => Ok(ResizeMode::LetterboxCentered),
+        ("stretch", _) => Ok(ResizeMode::Stretch),
+        (other, _) => Err(RtError::Json(format!(
+            "unsupported resize mode {other} for {}",
+            config_name(model_type)
+        ))),
+    }
+}
+
+fn parse_normalization(
+    section: &PreprocessingSection,
+    model_type: ModelType,
+) -> Result<Normalization> {
+    match (&section.normalization, section.value_scale) {
+        (None, Some(scale)) if scale.is_finite() && scale > 0.0 => Ok(Normalization::Scale(scale)),
+        (Some(normalization), _) => {
+            if normalization.mean == IMAGENET_MEAN && normalization.std == IMAGENET_STD {
+                Ok(Normalization::Imagenet)
+            } else {
+                Err(RtError::Json(format!(
+                    "unsupported normalization statistics for {}",
+                    config_name(model_type)
+                )))
+            }
+        }
+        (None, None) if model_type != ModelType::FramePresence => Ok(Normalization::Imagenet),
+        (None, None) => Err(RtError::Json(
+            "frame_presence bundle must describe its input value scale".into(),
+        )),
+        (None, Some(_)) => Err(RtError::Json(
+            "preprocessing value_scale must be finite and positive".into(),
+        )),
+    }
+}
+
+fn config_name(model_type: ModelType) -> &'static str {
+    match model_type {
+        ModelType::RoiPresence => "roi_presence",
+        ModelType::RoiPairMatcher => "roi_pair_matcher",
+        ModelType::FramePresence => "frame_presence",
+    }
 }
 
 fn validate_io(
@@ -234,6 +360,33 @@ fn load_presence_weights(
         ("presence_head.local.bias", vec![1]),
         ("presence_head.evidence_pool.log_scale", vec![]),
         ("presence_head.evidence_pool.bias", vec![]),
+    ] {
+        builder.add_raw_f32(raw, name, &shape)?;
+    }
+    Ok(())
+}
+
+fn load_frame_presence_weights(
+    raw: &HashMap<String, RawTensor<'_>>,
+    builder: &mut ModelBuilder,
+) -> Result<()> {
+    for (name, shape) in [
+        ("stem.0.weight", vec![16, 3, 5, 5]),
+        ("stem.0.bias", vec![16]),
+        ("detail.0.weight", vec![24, 16, 3, 3]),
+        ("detail.0.bias", vec![24]),
+        ("region_encoder.0.weight", vec![32, 24, 3, 3]),
+        ("region_encoder.0.bias", vec![32]),
+        ("context_encoder.0.weight", vec![48, 32, 3, 3]),
+        ("context_encoder.0.bias", vec![48]),
+        ("context_refine.0.weight", vec![48, 48, 3, 3]),
+        ("context_refine.0.bias", vec![48]),
+        ("context_projection.weight", vec![32, 48, 1, 1]),
+        ("context_projection.bias", vec![32]),
+        ("region_head.weight", vec![1, 32, 1, 1]),
+        ("region_head.bias", vec![1]),
+        ("local_evidence_aggregator.log_scale", vec![]),
+        ("local_evidence_aggregator.bias", vec![]),
     ] {
         builder.add_raw_f32(raw, name, &shape)?;
     }

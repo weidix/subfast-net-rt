@@ -92,3 +92,70 @@ fn rejects_wrong_config_format_without_fallback() {
     std::fs::write(config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
     assert!(Model::load(temp.path()).is_err());
 }
+
+#[test]
+fn loads_frame_presence_bundle_with_preprocessing_contract() {
+    let Some(path) = fixture("SUBFAST_RT_FRAME_PRESENCE_DIR") else {
+        eprintln!("skipping Frame Presence fixture; set SUBFAST_RT_FRAME_PRESENCE_DIR");
+        return;
+    };
+    let model = Model::load(path).unwrap();
+    assert_eq!(model.model_type, ModelType::FramePresence);
+    assert_eq!(model.input_info().len(), 1);
+    assert_eq!(model.input_info()[0].name, "images");
+    assert_eq!(model.input_info()[0].shape, [1, 3, 272, 480]);
+    assert_eq!(model.output_info()[0].name, "presence_logit");
+    assert_eq!(model.output_info()[0].shape, [1]);
+
+    let preprocessing = model.preprocessing.expect("frame presence contract");
+    assert_eq!(
+        preprocessing.resize_mode,
+        subfast_net_rt::image_infer::ResizeMode::LetterboxCentered
+    );
+    match preprocessing.normalization {
+        subfast_net_rt::model::Normalization::Scale(scale) => {
+            assert!((scale - 1.0 / 255.0).abs() < 1e-9, "{scale}");
+        }
+        other => panic!("unexpected normalization {other:?}"),
+    }
+    assert_eq!(model.decision_threshold, Some(0.5));
+    for target in [
+        "stem.0.weight",
+        "detail.0.weight",
+        "region_encoder.0.weight",
+        "context_encoder.0.weight",
+        "context_refine.0.weight",
+        "context_projection.weight",
+        "region_head.weight",
+        "local_evidence_aggregator.log_scale",
+        "local_evidence_aggregator.bias",
+    ] {
+        assert!(
+            model
+                .tensors
+                .iter()
+                .any(|tensor| tensor.target.as_deref() == Some(target)),
+            "missing {target}"
+        );
+    }
+}
+
+#[test]
+fn rejects_unaligned_frame_presence_input_dimensions() {
+    let Some(path) = fixture("SUBFAST_RT_FRAME_PRESENCE_DIR") else {
+        return;
+    };
+    let temp = tempfile::tempdir().unwrap();
+    copy_bundle(&path, temp.path());
+    let config_path = temp.path().join("config.json");
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&config_path).unwrap()).unwrap();
+    config["input"]["tensors"][0]["shape"] = serde_json::json!(["batch", 3, 270, 480]);
+    config["preprocessing"]["resize"]["target_size"] = serde_json::json!([480, 270]);
+    std::fs::write(config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    let error = Model::load(temp.path()).unwrap_err();
+    assert!(
+        error.to_string().contains("multiples of 16"),
+        "unexpected error: {error}"
+    );
+}

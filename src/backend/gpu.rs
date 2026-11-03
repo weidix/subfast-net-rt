@@ -1,18 +1,24 @@
-//! GPU backend for the ROI Presence and Pair Matcher models.
+//! GPU backend for ROI Presence, Pair Matcher, and Frame Presence V8.
 //!
-//! WGSL compute kernels are compiled through `wgpu-hal` and Naga to Metal on
-//! macOS and Vulkan on the other supported native targets. Input upload,
-//! command submission, and scalar readback are host operations; every model
-//! operator executes on the GPU. Weights, pipelines, bindings, and buffers are
-//! reused.
+//! WGSL kernels run through `wgpu-hal` on Metal or Vulkan. Frame Presence also
+//! uses a native Metal graph on supported Apple Silicon systems. Both paths
+//! keep model operators on the GPU and reuse compiled plans and buffers.
 
-use crate::backend::cpu::validate_roi_model;
+use crate::backend::cpu::{validate_model_io, validate_roi_model};
 use crate::backend::gpu_hal as hal;
 use crate::backend::{Backend, Executable};
 use crate::error::{Result, RtError};
 use crate::ir::tensor::{DType, TensorInfo, TensorKind};
-use crate::model::Model;
+use crate::model::{Model, ModelType};
 use crate::tensor::Tensor;
+
+mod frame_presence;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod metal_frame_presence;
+
+use frame_presence::FramePresenceGpu;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use metal_frame_presence::MetalFramePresence;
 
 const WORKGROUP_SIZE: usize = 64;
 
@@ -426,6 +432,16 @@ impl GpuBackend {
 pub struct GpuExecutable {
     input_shapes: Vec<Vec<usize>>,
     max_batch_size: usize,
+    execution: GpuExecution,
+}
+
+enum GpuExecution {
+    Hal(Box<HalExecutable>),
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    MetalGraph(MetalFramePresence),
+}
+
+struct HalExecutable {
     context: GpuContext,
     model: CompiledGpuModel,
 }
@@ -433,43 +449,60 @@ pub struct GpuExecutable {
 enum CompiledGpuModel {
     Presence(Box<PresenceGpu>),
     Pair(Box<PairGpu>),
+    FramePresence(Box<FramePresenceGpu>),
 }
 
 impl Backend for GpuBackend {
     type Executable = GpuExecutable;
 
     fn compile(&self, model: &Model) -> Result<Self::Executable> {
-        // Keep GPU model acceptance exactly aligned with the CPU backend.
-        validate_roi_model(model)?;
+        if model.model_type == ModelType::FramePresence {
+            validate_model_io(model)?;
+        } else {
+            // Keep GPU ROI model acceptance aligned with the CPU backend.
+            validate_roi_model(model)?;
+        }
         let input_shapes = model
             .input_info()
             .into_iter()
             .map(|info| info.shape.clone())
             .collect();
-        let context = GpuContext::new()?;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if model.model_type == ModelType::FramePresence
+            && let Some(executable) = MetalFramePresence::compile(model, self.max_batch_size)?
+        {
+            return Ok(GpuExecutable {
+                input_shapes,
+                max_batch_size: self.max_batch_size,
+                execution: GpuExecution::MetalGraph(executable),
+            });
+        }
+
+        let context = GpuContext::new(model.model_type != ModelType::FramePresence)?;
         context.validate_max_batch_size(self.max_batch_size)?;
-        let compiled = match model.inputs.len() {
-            1 => CompiledGpuModel::Presence(Box::new(PresenceGpu::compile(
+        let compiled = match (model.model_type, model.inputs.len()) {
+            (ModelType::FramePresence, _) => CompiledGpuModel::FramePresence(Box::new(
+                FramePresenceGpu::compile(model, &context, self.max_batch_size)?,
+            )),
+            (_, 1) => CompiledGpuModel::Presence(Box::new(PresenceGpu::compile(
                 model,
                 &context,
                 self.max_batch_size,
             )?)),
-            2 => CompiledGpuModel::Pair(Box::new(PairGpu::compile(
+            (_, 2) => CompiledGpuModel::Pair(Box::new(PairGpu::compile(
                 model,
                 &context,
                 self.max_batch_size,
             )?)),
-            count => {
-                return Err(RtError::Inference(format!(
-                    "GPU ROI backend expects one or two inputs, got {count}"
-                )));
-            }
+            _ => unreachable!("ROI input count was validated"),
         };
         Ok(GpuExecutable {
             input_shapes,
             max_batch_size: self.max_batch_size,
-            context,
-            model: compiled,
+            execution: GpuExecution::Hal(Box::new(HalExecutable {
+                context,
+                model: compiled,
+            })),
         })
     }
 }
@@ -480,11 +513,19 @@ impl GpuExecutable {
     }
 
     pub fn backend_name(&self) -> &'static str {
-        self.context.backend_name
+        match &self.execution {
+            GpuExecution::Hal(executable) => executable.context.backend_name,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            GpuExecution::MetalGraph(_) => "metal-mpsgraph",
+        }
     }
 
     pub fn adapter_name(&self) -> &str {
-        &self.context.adapter_name
+        match &self.execution {
+            GpuExecution::Hal(executable) => &executable.context.adapter_name,
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            GpuExecution::MetalGraph(executable) => &executable.adapter_name,
+        }
     }
 
     pub fn max_batch_size(&self) -> usize {
@@ -523,16 +564,23 @@ impl GpuExecutable {
         if output.is_empty() {
             return Ok(());
         }
-        let batch_size = output.len();
-        match &mut self.model {
-            CompiledGpuModel::Presence(model) => {
-                model.run(&mut self.context, inputs, batch_size, output)?
+        match &mut self.execution {
+            GpuExecution::Hal(executable) => {
+                let context = &mut executable.context;
+                let batch_size = output.len();
+                match &mut executable.model {
+                    CompiledGpuModel::Presence(model) => {
+                        model.run(context, inputs, batch_size, output)
+                    }
+                    CompiledGpuModel::Pair(model) => model.run(context, inputs, batch_size, output),
+                    CompiledGpuModel::FramePresence(model) => {
+                        model.run(context, &inputs[0].data, output)
+                    }
+                }
             }
-            CompiledGpuModel::Pair(model) => {
-                model.run(&mut self.context, inputs, batch_size, output)?
-            }
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            GpuExecution::MetalGraph(executable) => executable.run(&inputs[0].data, output),
         }
-        Ok(())
     }
 
     pub fn run_batch(&mut self, inputs: &[Tensor]) -> Result<Tensor> {
@@ -551,23 +599,29 @@ impl Executable for GpuExecutable {
 struct GpuContext {
     device: hal::Device,
     runner: hal::Runner,
-    conv_pipeline: hal::Pipeline,
+    roi_conv_pipeline: Option<hal::Pipeline>,
     backend_name: &'static str,
     adapter_name: String,
 }
 
 impl GpuContext {
-    fn new() -> Result<Self> {
+    fn new(compile_roi_pipeline: bool) -> Result<Self> {
         let (device, info) = hal::Device::new()?;
         let runner = device.create_runner()?;
-        let conv_pipeline = create_pipeline(&device, "subfast ROI convolution", CONV_SHADER)?;
+        let roi_conv_pipeline = compile_roi_pipeline
+            .then(|| create_pipeline(&device, "subfast ROI convolution", CONV_SHADER))
+            .transpose()?;
         Ok(Self {
             device,
             runner,
-            conv_pipeline,
+            roi_conv_pipeline,
             backend_name: hal::backend_name(),
             adapter_name: info.name,
         })
+    }
+
+    fn roi_conv_pipeline(&self) -> &hal::Pipeline {
+        self.roi_conv_pipeline.as_ref().expect("ROI GPU context")
     }
 
     fn validate_max_batch_size(&self, max_batch_size: usize) -> Result<()> {
@@ -593,8 +647,9 @@ impl GpuContext {
         host_output: &mut [f32],
     ) -> Result<()> {
         self.runner.begin("subfast ROI inference")?;
+        let roi_pipeline = self.roi_conv_pipeline.as_ref().expect("ROI GPU context");
         for layer in layers {
-            let pipeline = layer.pipeline.as_ref().unwrap_or(&self.conv_pipeline);
+            let pipeline = layer.pipeline.as_ref().unwrap_or(roi_pipeline);
             self.runner.dispatch(
                 pipeline,
                 &layer.bind_group,
@@ -625,8 +680,9 @@ impl GpuContext {
             &features.bind_group,
             [features.workgroups_per_sample, batch_size as u32, 1],
         );
+        let roi_pipeline = self.roi_conv_pipeline.as_ref().expect("ROI GPU context");
         for layer in layers {
-            let pipeline = layer.pipeline.as_ref().unwrap_or(&self.conv_pipeline);
+            let pipeline = layer.pipeline.as_ref().unwrap_or(roi_pipeline);
             self.runner.dispatch(
                 pipeline,
                 &layer.bind_group,
@@ -1049,6 +1105,9 @@ fn spatial_dense_conv_shader(
     f16_weights: bool,
     batch_tile: usize,
     workgroup_size: usize,
+    relu: bool,
+    spatial_tile: usize,
+    block_groups: usize,
 ) -> String {
     let enable_f16 = if f16_weights { "enable f16;" } else { "" };
     let weight_type = if f16_weights {
@@ -1057,9 +1116,9 @@ fn spatial_dense_conv_shader(
         "array<vec4<f32>>"
     };
     let output_groups = params.out_channels / 4;
-    let groups_per_invocation = output_groups.min(4);
+    let groups_per_invocation = block_groups;
     let blocks = output_groups.div_ceil(groups_per_invocation);
-    let accumulators = (0..batch_tile)
+    let accumulators = (0..batch_tile * spatial_tile)
         .flat_map(|sample| {
             (0..groups_per_invocation).map(move |group| {
                 format!("    var sum{sample}_{group} = bias[output_group_base + {group}u];")
@@ -1068,6 +1127,7 @@ fn spatial_dense_conv_shader(
         .collect::<Vec<_>>()
         .join("\n");
     let vector_source = !params.source_nchw && params.in_channels.is_multiple_of(4);
+    let source_scalar = if vector_source { "vec4<f32>" } else { "f32" };
     let source_type = if vector_source {
         "array<vec4<f32>>"
     } else {
@@ -1081,10 +1141,10 @@ fn spatial_dense_conv_shader(
         }
     };
     let channel_loop = if vector_source {
-        let source_values = (0..batch_tile)
+        let source_values = (0..batch_tile * spatial_tile)
             .map(|sample| {
                 format!(
-                    "                let source_value{sample} = source[(sample_base + {sample}u) * INPUT_H * INPUT_W * INPUT_GROUPS\n                    + (u32(input_y) * INPUT_W + u32(input_x)) * INPUT_GROUPS\n                    + input_group];"
+                    "                let source_value{sample} = read_source((sample_base + {sample}u / SPATIAL_TILE) * INPUT_H * INPUT_W * INPUT_GROUPS\n                    + (u32(input_y) * INPUT_W + u32(input_x) + ({sample}u % SPATIAL_TILE) * STRIDE_W) * INPUT_GROUPS\n                    + input_group, input_x + i32(({sample}u % SPATIAL_TILE) * STRIDE_W));"
                 )
             })
             .collect::<Vec<_>>()
@@ -1103,7 +1163,7 @@ fn spatial_dense_conv_shader(
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
-                let updates = (0..batch_tile)
+                let updates = (0..batch_tile * spatial_tile)
                     .flat_map(|sample| {
                         (0..groups_per_invocation).map(move |group| {
                             format!(
@@ -1121,12 +1181,12 @@ fn spatial_dense_conv_shader(
             "            for (var input_group = 0u; input_group < INPUT_GROUPS; input_group += 1u) {{\n{source_values}\n                let weight_base = (kernel_base * IN_CHANNELS + input_group * 4u) * OUT_GROUPS;\n{component_blocks}\n            }}"
         )
     } else {
-        let source_values = (0..batch_tile)
+        let source_values = (0..batch_tile * spatial_tile)
             .map(|sample| {
                 let source_index = format!(
-                    "(sample_base + {sample}u) * INPUT_H * INPUT_W * IN_CHANNELS\n                    + input_channel * INPUT_H * INPUT_W\n                    + u32(input_y) * INPUT_W + u32(input_x)"
+                    "(sample_base + {sample}u / SPATIAL_TILE) * INPUT_H * INPUT_W * IN_CHANNELS\n                    + input_channel * INPUT_H * INPUT_W\n                    + u32(input_y) * INPUT_W + u32(input_x) + ({sample}u % SPATIAL_TILE) * STRIDE_W"
                 );
-                format!("                let source_value{sample} = source[{source_index}];")
+                format!("                let source_value{sample} = read_source({source_index}, input_x + i32(({sample}u % SPATIAL_TILE) * STRIDE_W));")
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -1139,7 +1199,7 @@ fn spatial_dense_conv_shader(
             })
             .collect::<Vec<_>>()
             .join("\n");
-        let updates = (0..batch_tile)
+        let updates = (0..batch_tile * spatial_tile)
             .flat_map(|sample| {
                 (0..groups_per_invocation).map(move |group| {
                     format!(
@@ -1153,16 +1213,18 @@ fn spatial_dense_conv_shader(
             "            for (var input_channel = 0u; input_channel < IN_CHANNELS; input_channel += 1u) {{\n{source_values}\n                let weight_base = (kernel_base * IN_CHANNELS + input_channel) * OUT_GROUPS;\n{weight_loads}\n{updates}\n            }}"
         )
     };
-    let stores = (0..batch_tile)
+    let stores = (0..batch_tile * spatial_tile)
         .flat_map(|sample| {
             (0..groups_per_invocation).map(move |group| {
-                let value = if params.activation {
+                let value = if relu {
+                    format!("max(sum{sample}_{group}, vec4<f32>(0.0))")
+                } else if params.activation {
                     format!("silu(sum{sample}_{group})")
                 } else {
                     format!("sum{sample}_{group}")
                 };
                 format!(
-                    "    destination[(sample_base + {sample}u) * OUTPUT_H * OUTPUT_W * OUT_GROUPS\n        + spatial * OUT_GROUPS + output_group_base + {group}u] = {value};"
+                    "    destination[(sample_base + {sample}u / SPATIAL_TILE) * OUTPUT_H * OUTPUT_W * OUT_GROUPS\n        + (spatial + {sample}u % SPATIAL_TILE) * OUT_GROUPS + output_group_base + {group}u] = {value};"
                 )
             })
         })
@@ -1188,11 +1250,19 @@ const PADDING_W: u32 = {padding_w}u;
 const DILATION_H: u32 = {dilation_h}u;
 const DILATION_W: u32 = {dilation_w}u;
 const BATCH_TILE: u32 = {batch_tile}u;
+const SPATIAL_TILE: u32 = {spatial_tile}u;
 
 @group(0) @binding(0) var<storage, read> source: {source_type};
 @group(0) @binding(1) var<storage, read> weights: {weight_type};
 @group(0) @binding(2) var<storage, read> bias: array<vec4<f32>>;
 @group(0) @binding(3) var<storage, read_write> destination: array<vec4<f32>>;
+
+fn read_source(index: u32, x: i32) -> {source_scalar} {{
+    if (x < 0 || x >= i32(INPUT_W)) {{
+        return {source_scalar}(0.0);
+    }}
+    return source[index];
+}}
 
 fn fast_exp(value: f32) -> f32 {{
     return exp(value);
@@ -1211,7 +1281,10 @@ fn silu(value: vec4<f32>) -> vec4<f32> {{
 fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {{
     let local = invocation.x;
     let sample_base = invocation.y * BATCH_TILE;
-    let spatial = local / BLOCKS;
+    let spatial = local / BLOCKS * SPATIAL_TILE;
+    if (spatial >= OUTPUT_H * OUTPUT_W) {{
+        return;
+    }}
     let output_group_base = (local % BLOCKS) * BLOCK_GROUPS;
     let output_x = spatial % OUTPUT_W;
     let output_y = spatial / OUTPUT_W;
@@ -1226,7 +1299,7 @@ fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {{
         for (var kernel_x = 0u; kernel_x < KERNEL_W; kernel_x += 1u) {{
             let input_x = i32(output_x * STRIDE_W + kernel_x * DILATION_W)
                 - i32(PADDING_W);
-            if (input_x < 0 || input_x >= i32(INPUT_W)) {{
+            if (input_x + i32((SPATIAL_TILE - 1u) * STRIDE_W) < 0 || input_x >= i32(INPUT_W)) {{
                 continue;
             }}
             let kernel_base = kernel_y * KERNEL_W + kernel_x;
@@ -1253,6 +1326,8 @@ fn main(@builtin(global_invocation_id) invocation: vec3<u32>) {{
         dilation_h = params.dilation[0],
         dilation_w = params.dilation[1],
         batch_tile = batch_tile,
+        spatial_tile = spatial_tile,
+        source_scalar = source_scalar,
         enable_f16 = enable_f16,
         weight_type = weight_type,
         source_type = source_type,
@@ -1631,7 +1706,15 @@ impl GpuLayer {
                 WORKGROUP_SIZE
             };
             let shader_source = if spatial_dense {
-                spatial_dense_conv_shader(params, f16_weights, 1, workgroup_size)
+                spatial_dense_conv_shader(
+                    params,
+                    f16_weights,
+                    1,
+                    workgroup_size,
+                    false,
+                    1,
+                    (params.out_channels / 4).min(4),
+                )
             } else {
                 vector_conv_shader(params, f16_weights, 1)
             };
@@ -1685,7 +1768,7 @@ impl GpuLayer {
         )?;
         let bind_group = sequential_bind_group(
             &context.device,
-            &context.conv_pipeline,
+            context.roi_conv_pipeline(),
             "subfast ROI convolution bindings",
             &[source, &weight_buffer, &bias_buffer, target, &params_buffer],
         )?;
